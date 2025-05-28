@@ -1,3 +1,4 @@
+
 import asyncio
 import logging
 import os
@@ -70,7 +71,7 @@ class TelegramBot:
                 "2. **URL Upload**: Send a URL pointing to a file\n\n"
                 "**Features:**\n"
                 "• Supports files up to 4GB\n"
-                "• Real-time progress updates\n"
+                "• Real-time progress updates with speed\n"
                 "• Direct upload to GitHub releases\n"
                 "• Returns download URL after upload\n\n"
                 f"**Target Repository:** `{self.github_repo}`\n"
@@ -250,34 +251,43 @@ class TelegramBot:
                     del self.active_uploads[user_id]
 
     async def download_telegram_file_streaming(self, document, temp_file, progress_msg, filename: str):
-        """Download file from Telegram with progress using streaming to temp file"""
+        """Download file from Telegram with progress and speed using streaming to temp file"""
         total_size = document.size
         downloaded = 0
-        last_update = 0
+        start_time = time.time()
+        last_update_time = start_time
+        last_downloaded = 0
         
         async def progress_callback(current, total):
-            nonlocal downloaded, last_update
+            nonlocal downloaded, last_update_time, last_downloaded
             downloaded = current
+            current_time = time.time()
             progress = (current / total) * 100
             
-            # Update every 5% or every 3 seconds
-            current_time = time.time()
-            if progress - last_update >= 5 or current_time - getattr(progress_callback, 'last_time', 0) >= 3:
+            # Calculate speed
+            time_diff = current_time - last_update_time
+            bytes_diff = current - last_downloaded
+            speed = bytes_diff / time_diff if time_diff > 0 else 0
+            
+            # Update every 2% progress or every 2 seconds
+            if progress - getattr(progress_callback, 'last_progress', 0) >= 2 or time_diff >= 2:
                 await progress_msg.edit(
                     f"📥 **Downloading from Telegram...**\n\n"
                     f"📁 {filename}\n"
                     f"📊 {self.format_size(current)} / {self.format_size(total)}\n"
                     f"⏳ {progress:.1f}%\n"
+                    f"🚀 Speed: {self.format_size(speed)}/s\n"
                     f"{'█' * int(progress // 5)}{'░' * (20 - int(progress // 5))}"
                 )
-                last_update = progress
-                progress_callback.last_time = current_time
+                progress_callback.last_progress = progress
+                last_update_time = current_time
+                last_downloaded = current
         
         # Download file to temporary file using streaming
         await self.client.download_media(document, file=temp_file, progress_callback=progress_callback)
 
     async def download_from_url_streaming(self, url: str, temp_file, progress_msg, filename: str) -> int:
-        """Download file from URL with progress using streaming to temp file"""
+        """Download file from URL with progress and speed using streaming to temp file"""
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as response:
                 if response.status != 200:
@@ -285,53 +295,71 @@ class TelegramBot:
                 
                 total_size = int(response.headers.get('content-length', 0))
                 downloaded = 0
-                last_update = 0
+                start_time = time.time()
+                last_update_time = start_time
+                last_downloaded = 0
                 
                 async for chunk in response.content.iter_chunked(1024 * 1024):  # 1MB chunks
                     temp_file.write(chunk)
                     downloaded += len(chunk)
+                    current_time = time.time()
                     
                     if total_size > 0:
                         progress = (downloaded / total_size) * 100
                         
-                        # Update every 5% or every 3 seconds
-                        current_time = time.time()
-                        if progress - last_update >= 5 or current_time - getattr(self, '_last_url_update', 0) >= 3:
+                        # Calculate speed
+                        time_diff = current_time - last_update_time
+                        bytes_diff = downloaded - last_downloaded
+                        speed = bytes_diff / time_diff if time_diff > 0 else 0
+                        
+                        # Update every 2% progress or every 2 seconds
+                        if progress - getattr(self, '_last_url_progress', 0) >= 2 or time_diff >= 2:
                             await progress_msg.edit(
                                 f"📥 **Downloading from URL...**\n\n"
                                 f"📁 {filename}\n"
                                 f"📊 {self.format_size(downloaded)} / {self.format_size(total_size)}\n"
                                 f"⏳ {progress:.1f}%\n"
+                                f"🚀 Speed: {self.format_size(speed)}/s\n"
                                 f"{'█' * int(progress // 5)}{'░' * (20 - int(progress // 5))}"
                             )
-                            last_update = progress
-                            self._last_url_update = current_time
+                            self._last_url_progress = progress
+                            last_update_time = current_time
+                            last_downloaded = downloaded
                 
                 temp_file.flush()
                 return downloaded
 
     async def upload_to_github_streaming(self, temp_file_path: str, filename: str, file_size: int, progress_msg) -> str:
-        """Upload file to GitHub with progress using streaming"""
+        """Upload file to GitHub with progress and speed using streaming"""
         uploaded = 0
-        last_update = 0
+        start_time = time.time()
+        last_update_time = start_time
+        last_uploaded = 0
         
         async def progress_callback(current: int):
-            nonlocal uploaded, last_update
+            nonlocal uploaded, last_update_time, last_uploaded
             uploaded = current
+            current_time = time.time()
             progress = (current / file_size) * 100
             
-            # Update every 5% or every 3 seconds
-            current_time = time.time()
-            if progress - last_update >= 5 or current_time - getattr(progress_callback, 'last_time', 0) >= 3:
+            # Calculate speed
+            time_diff = current_time - last_update_time
+            bytes_diff = current - last_uploaded
+            speed = bytes_diff / time_diff if time_diff > 0 else 0
+            
+            # Update every 2% progress or every 2 seconds
+            if progress - getattr(progress_callback, 'last_progress', 0) >= 2 or time_diff >= 2:
                 await progress_msg.edit(
                     f"📤 **Uploading to GitHub...**\n\n"
                     f"📁 {filename}\n"
                     f"📊 {self.format_size(current)} / {self.format_size(file_size)}\n"
                     f"⏳ {progress:.1f}%\n"
+                    f"🚀 Speed: {self.format_size(speed)}/s\n"
                     f"{'█' * int(progress // 5)}{'░' * (20 - int(progress // 5))}"
                 )
-                last_update = progress
-                progress_callback.last_time = current_time
+                progress_callback.last_progress = progress
+                last_update_time = current_time
+                last_uploaded = current
         
         return await self.github_uploader.upload_asset_streaming(temp_file_path, filename, file_size, progress_callback)
 

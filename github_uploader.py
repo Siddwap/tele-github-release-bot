@@ -5,6 +5,7 @@ from typing import Callable, Optional
 import json
 import io
 import os
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +59,7 @@ class GitHubUploader:
                 return False
 
     async def upload_asset_streaming(self, file_path: str, filename: str, file_size: int, progress_callback: Optional[Callable] = None) -> str:
-        """Upload file as release asset using streaming from file"""
+        """Upload file as release asset using streaming from file with speed tracking"""
         try:
             # Get release info
             release_info = await self.get_release_info()
@@ -77,10 +78,13 @@ class GitHubUploader:
                 "Content-Length": str(file_size)
             }
             
-            # Create async generator for streaming upload
+            # Create async generator for streaming upload with speed tracking
             async def file_generator():
                 chunk_size = 1024 * 1024  # 1MB chunks
                 uploaded = 0
+                start_time = time.time()
+                last_callback_time = start_time
+                last_callback_bytes = 0
                 
                 with open(file_path, 'rb') as f:
                     while True:
@@ -89,9 +93,13 @@ class GitHubUploader:
                             break
                         
                         uploaded += len(chunk)
+                        current_time = time.time()
                         
-                        if progress_callback:
-                            progress_callback(uploaded)
+                        # Call progress callback with proper speed calculation
+                        if progress_callback and (current_time - last_callback_time >= 0.5 or uploaded == file_size):
+                            await progress_callback(uploaded)
+                            last_callback_time = current_time
+                            last_callback_bytes = uploaded
                         
                         yield chunk
 
