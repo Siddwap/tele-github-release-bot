@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 import os
@@ -40,6 +39,34 @@ class TelegramBot:
         self.client = TelegramClient('bot', self.api_id, self.api_hash)
         self.github_uploader = GitHubUploader(self.github_token, self.github_repo, self.github_release_tag)
         self.active_uploads = {}
+
+    def sanitize_filename(self, filename: str) -> str:
+        """Sanitize filename by replacing special characters while preserving extension"""
+        import re
+        
+        # Split filename and extension
+        if '.' in filename:
+            name_part = '.'.join(filename.split('.')[:-1])
+            extension = filename.split('.')[-1]
+        else:
+            name_part = filename
+            extension = ''
+        
+        # Replace special characters with safe alternatives
+        # Keep only alphanumeric, spaces, dots, hyphens, and underscores
+        name_part = re.sub(r'[^\w\s\-_.]', '_', name_part)
+        
+        # Replace multiple spaces/underscores with single underscore
+        name_part = re.sub(r'[\s_]+', '_', name_part)
+        
+        # Remove leading/trailing underscores
+        name_part = name_part.strip('_')
+        
+        # Reconstruct filename with extension
+        if extension:
+            return f"{name_part}.{extension}"
+        else:
+            return name_part
 
     async def start(self):
         """Start the bot"""
@@ -158,8 +185,13 @@ class TelegramBot:
                 filename = attr.file_name
                 break
         
+        # Sanitize filename to avoid GitHub upload issues
+        sanitized_filename = self.sanitize_filename(filename)
+        if sanitized_filename != filename:
+            logger.info(f"Sanitized filename: '{filename}' -> '{sanitized_filename}'")
+        
         file_size = document.size
-        logger.info(f"Receiving file: {filename}, size: {file_size} bytes")
+        logger.info(f"Receiving file: {sanitized_filename}, size: {file_size} bytes")
         
         # Check file size (4GB limit)
         if file_size > 4 * 1024 * 1024 * 1024:
@@ -167,7 +199,7 @@ class TelegramBot:
             return
 
         self.active_uploads[user_id] = {
-            'filename': filename,
+            'filename': sanitized_filename,
             'status': 'Starting download...'
         }
 
@@ -177,15 +209,15 @@ class TelegramBot:
         with tempfile.NamedTemporaryFile(delete=False) as temp_file:
             try:
                 # Download file with progress to temporary file
-                await self.download_telegram_file_streaming(document, temp_file, progress_msg, filename)
+                await self.download_telegram_file_streaming(document, temp_file, progress_msg, sanitized_filename)
                 
                 # Upload to GitHub from temporary file
                 await progress_msg.edit("📤 **Uploading to GitHub...**\n⏳ Starting...")
-                download_url = await self.upload_to_github_streaming(temp_file.name, filename, file_size, progress_msg)
+                download_url = await self.upload_to_github_streaming(temp_file.name, sanitized_filename, file_size, progress_msg)
                 
                 await progress_msg.edit(
                     f"✅ **Upload Complete!**\n\n"
-                    f"📁 **File:** `{filename}`\n"
+                    f"📁 **File:** `{sanitized_filename}`\n"
                     f"📊 **Size:** {self.format_size(file_size)}\n"
                     f"🔗 **Download URL:**\n{download_url}"
                 )
@@ -212,10 +244,15 @@ class TelegramBot:
         if '?' in filename:
             filename = filename.split('?')[0]
         
+        # Sanitize filename to avoid GitHub upload issues
+        sanitized_filename = self.sanitize_filename(filename)
+        if sanitized_filename != filename:
+            logger.info(f"Sanitized filename: '{filename}' -> '{sanitized_filename}'")
+        
         logger.info(f"Downloading from URL: {url}")
         
         self.active_uploads[user_id] = {
-            'filename': filename,
+            'filename': sanitized_filename,
             'status': 'Starting download...'
         }
 
@@ -225,15 +262,15 @@ class TelegramBot:
         with tempfile.NamedTemporaryFile(delete=False) as temp_file:
             try:
                 # Download from URL with progress to temporary file
-                file_size = await self.download_from_url_streaming(url, temp_file, progress_msg, filename)
+                file_size = await self.download_from_url_streaming(url, temp_file, progress_msg, sanitized_filename)
                 
                 # Upload to GitHub from temporary file
                 await progress_msg.edit("📤 **Uploading to GitHub...**\n⏳ Starting...")
-                download_url = await self.upload_to_github_streaming(temp_file.name, filename, file_size, progress_msg)
+                download_url = await self.upload_to_github_streaming(temp_file.name, sanitized_filename, file_size, progress_msg)
                 
                 await progress_msg.edit(
                     f"✅ **Upload Complete!**\n\n"
-                    f"📁 **File:** `{filename}`\n"
+                    f"📁 **File:** `{sanitized_filename}`\n"
                     f"📊 **Size:** {self.format_size(file_size)}\n"
                     f"🔗 **Download URL:**\n{download_url}"
                 )
