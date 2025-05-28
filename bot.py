@@ -1,9 +1,11 @@
+
 import asyncio
 import logging
 import os
 import tempfile
 from datetime import datetime
-from typing import Optional, BinaryIO
+from typing import Optional, BinaryIO, Dict, List
+from collections import deque
 import aiohttp
 from telethon import TelegramClient, events
 from telethon.tl.types import DocumentAttributeFilename
@@ -39,6 +41,8 @@ class TelegramBot:
         self.client = TelegramClient('bot', self.api_id, self.api_hash)
         self.github_uploader = GitHubUploader(self.github_token, self.github_repo, self.github_release_tag)
         self.active_uploads = {}
+        self.upload_queues: Dict[int, deque] = {}  # User ID -> queue of uploads
+        self.processing_queues: Dict[int, bool] = {}  # User ID -> is processing
 
     def sanitize_filename(self, filename: str) -> str:
         """Sanitize filename by replacing special characters while preserving extension"""
@@ -68,6 +72,125 @@ class TelegramBot:
         else:
             return name_part
 
+    async def add_to_queue(self, user_id: int, upload_item: dict):
+        """Add upload item to user's queue"""
+        if user_id not in self.upload_queues:
+            self.upload_queues[user_id] = deque()
+        
+        self.upload_queues[user_id].append(upload_item)
+        await self.process_queue(user_id)
+
+    async def process_queue(self, user_id: int):
+        """Process upload queue for a user"""
+        if user_id in self.processing_queues and self.processing_queues[user_id]:
+            return  # Already processing
+        
+        if user_id not in self.upload_queues or not self.upload_queues[user_id]:
+            return  # No items in queue
+        
+        self.processing_queues[user_id] = True
+        
+        try:
+            while self.upload_queues[user_id]:
+                upload_item = self.upload_queues[user_id].popleft()
+                
+                # Update active uploads
+                self.active_uploads[user_id] = {
+                    'filename': upload_item['filename'],
+                    'status': f"Processing... ({len(self.upload_queues[user_id])} remaining in queue)"
+                }
+                
+                if upload_item['type'] == 'file':
+                    await self.process_file_upload(upload_item)
+                elif upload_item['type'] == 'url':
+                    await self.process_url_upload(upload_item)
+                
+        except Exception as e:
+            logger.error(f"Error processing queue for user {user_id}: {e}")
+        finally:
+            self.processing_queues[user_id] = False
+            if user_id in self.active_uploads:
+                del self.active_uploads[user_id]
+
+    async def process_file_upload(self, upload_item: dict):
+        """Process a single file upload from queue"""
+        event = upload_item['event']
+        document = upload_item['document']
+        filename = upload_item['filename']
+        file_size = upload_item['file_size']
+        user_id = upload_item['user_id']
+        
+        progress_msg = await event.respond("📥 **Downloading from Telegram...**\n⏳ Starting...")
+        
+        # Use temporary file for streaming
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            try:
+                # Download file with progress to temporary file
+                await self.download_telegram_file_streaming(document, temp_file, progress_msg, filename)
+                
+                # Upload to GitHub from temporary file
+                await progress_msg.edit("📤 **Uploading to GitHub...**\n⏳ Starting...")
+                download_url = await self.upload_to_github_streaming(temp_file.name, filename, file_size, progress_msg)
+                
+                remaining = len(self.upload_queues.get(user_id, []))
+                queue_text = f"\n\n📋 **Queue:** {remaining} files remaining" if remaining > 0 else ""
+                
+                await progress_msg.edit(
+                    f"✅ **Upload Complete!**\n\n"
+                    f"📁 **File:** `{filename}`\n"
+                    f"📊 **Size:** {self.format_size(file_size)}\n"
+                    f"🔗 **Download URL:**\n{download_url}{queue_text}"
+                )
+                
+            except Exception as e:
+                logger.error(f"Error uploading file: {e}")
+                await progress_msg.edit(f"❌ **Upload Failed**\n\nError: {str(e)}")
+            finally:
+                # Clean up temporary file
+                try:
+                    os.unlink(temp_file.name)
+                except:
+                    pass
+
+    async def process_url_upload(self, upload_item: dict):
+        """Process a single URL upload from queue"""
+        event = upload_item['event']
+        url = upload_item['url']
+        filename = upload_item['filename']
+        user_id = upload_item['user_id']
+        
+        progress_msg = await event.respond("📥 **Downloading from URL...**\n⏳ Starting...")
+        
+        # Use temporary file for streaming
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            try:
+                # Download from URL with progress to temporary file
+                file_size = await self.download_from_url_streaming(url, temp_file, progress_msg, filename)
+                
+                # Upload to GitHub from temporary file
+                await progress_msg.edit("📤 **Uploading to GitHub...**\n⏳ Starting...")
+                download_url = await self.upload_to_github_streaming(temp_file.name, filename, file_size, progress_msg)
+                
+                remaining = len(self.upload_queues.get(user_id, []))
+                queue_text = f"\n\n📋 **Queue:** {remaining} files remaining" if remaining > 0 else ""
+                
+                await progress_msg.edit(
+                    f"✅ **Upload Complete!**\n\n"
+                    f"📁 **File:** `{filename}`\n"
+                    f"📊 **Size:** {self.format_size(file_size)}\n"
+                    f"🔗 **Download URL:**\n{download_url}{queue_text}"
+                )
+                
+            except Exception as e:
+                logger.error(f"Error processing URL: {e}")
+                await progress_msg.edit(f"❌ **Upload Failed**\n\nError: {str(e)}")
+            finally:
+                # Clean up temporary file
+                try:
+                    os.unlink(temp_file.name)
+                except:
+                    pass
+
     async def start(self):
         """Start the bot"""
         try:
@@ -81,12 +204,18 @@ class TelegramBot:
         async def start_handler(event):
             await event.respond(
                 "🤖 **GitHub Release Uploader Bot**\n\n"
-                "Send me a file or a URL to upload to GitHub release!\n\n"
+                "Send me files or URLs to upload to GitHub release!\n\n"
+                "**Features:**\n"
+                "• Send multiple files - they'll upload one by one\n"
+                "• Send multiple URLs - processed in order\n"
+                "• Real-time progress with speed display\n"
+                "• Queue system for batch uploads\n\n"
                 "**Commands:**\n"
                 "• Send any file (up to 4GB)\n"
                 "• Send a URL to download and upload\n"
                 "• /help - Show this message\n"
-                "• /status - Check upload status"
+                "• /status - Check upload status\n"
+                "• /queue - Check queue status"
             )
             raise events.StopPropagation
 
@@ -95,10 +224,12 @@ class TelegramBot:
             await event.respond(
                 "**How to use:**\n\n"
                 "1. **File Upload**: Send any file directly to the bot\n"
-                "2. **URL Upload**: Send a URL pointing to a file\n\n"
+                "2. **URL Upload**: Send a URL pointing to a file\n"
+                "3. **Batch Upload**: Send multiple files/URLs - they'll queue automatically\n\n"
                 "**Features:**\n"
                 "• Supports files up to 4GB\n"
                 "• Real-time progress updates with speed\n"
+                "• Queue system for multiple uploads\n"
                 "• Direct upload to GitHub releases\n"
                 "• Returns download URL after upload\n\n"
                 f"**Target Repository:** `{self.github_repo}`\n"
@@ -116,6 +247,24 @@ class TelegramBot:
                 await event.respond("No active uploads")
             raise events.StopPropagation
 
+        @self.client.on(events.NewMessage(pattern='/queue'))
+        async def queue_handler(event):
+            user_id = event.sender_id
+            if user_id in self.upload_queues and self.upload_queues[user_id]:
+                queue_count = len(self.upload_queues[user_id])
+                queue_items = []
+                for i, item in enumerate(list(self.upload_queues[user_id])[:5]):  # Show first 5
+                    queue_items.append(f"{i+1}. {item['filename']}")
+                
+                queue_text = "\n".join(queue_items)
+                if queue_count > 5:
+                    queue_text += f"\n... and {queue_count - 5} more"
+                
+                await event.respond(f"📋 **Upload Queue ({queue_count} items):**\n\n{queue_text}")
+            else:
+                await event.respond("📋 Queue is empty")
+            raise events.StopPropagation
+
         @self.client.on(events.NewMessage)
         async def message_handler(event):
             # Skip if it's a command (already handled by specific handlers)
@@ -123,11 +272,6 @@ class TelegramBot:
                 return
             
             user_id = event.sender_id
-            
-            # Check if user has active upload
-            if user_id in self.active_uploads:
-                await event.respond("⚠️ You have an active upload. Please wait for it to complete.")
-                return
 
             try:
                 # Handle file uploads
@@ -157,8 +301,6 @@ class TelegramBot:
             except Exception as e:
                 logger.error(f"Error handling message from user {user_id}: {e}")
                 await event.respond(f"❌ **Error**\n\nSomething went wrong: {str(e)}")
-                if user_id in self.active_uploads:
-                    del self.active_uploads[user_id]
 
         try:
             await self.client.run_until_disconnected()
@@ -174,7 +316,7 @@ class TelegramBot:
         return text.startswith(('http://', 'https://')) and len(text) > 8
 
     async def handle_file_upload(self, event):
-        """Handle file upload from Telegram using temporary file streaming"""
+        """Handle file upload by adding to queue"""
         user_id = event.sender_id
         document = event.message.document
         
@@ -191,51 +333,30 @@ class TelegramBot:
             logger.info(f"Sanitized filename: '{filename}' -> '{sanitized_filename}'")
         
         file_size = document.size
-        logger.info(f"Receiving file: {sanitized_filename}, size: {file_size} bytes")
+        logger.info(f"Queuing file: {sanitized_filename}, size: {file_size} bytes")
         
         # Check file size (4GB limit)
         if file_size > 4 * 1024 * 1024 * 1024:
             await event.respond("❌ File too large. Maximum size is 4GB.")
             return
 
-        self.active_uploads[user_id] = {
+        # Add to queue
+        upload_item = {
+            'type': 'file',
+            'event': event,
+            'document': document,
             'filename': sanitized_filename,
-            'status': 'Starting download...'
+            'file_size': file_size,
+            'user_id': user_id
         }
-
-        progress_msg = await event.respond("📥 **Downloading from Telegram...**\n⏳ Starting...")
         
-        # Use temporary file for streaming
-        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-            try:
-                # Download file with progress to temporary file
-                await self.download_telegram_file_streaming(document, temp_file, progress_msg, sanitized_filename)
-                
-                # Upload to GitHub from temporary file
-                await progress_msg.edit("📤 **Uploading to GitHub...**\n⏳ Starting...")
-                download_url = await self.upload_to_github_streaming(temp_file.name, sanitized_filename, file_size, progress_msg)
-                
-                await progress_msg.edit(
-                    f"✅ **Upload Complete!**\n\n"
-                    f"📁 **File:** `{sanitized_filename}`\n"
-                    f"📊 **Size:** {self.format_size(file_size)}\n"
-                    f"🔗 **Download URL:**\n{download_url}"
-                )
-                
-            except Exception as e:
-                logger.error(f"Error uploading file: {e}")
-                await progress_msg.edit(f"❌ **Upload Failed**\n\nError: {str(e)}")
-            finally:
-                # Clean up temporary file
-                try:
-                    os.unlink(temp_file.name)
-                except:
-                    pass
-                if user_id in self.active_uploads:
-                    del self.active_uploads[user_id]
+        queue_position = len(self.upload_queues.get(user_id, [])) + 1
+        await event.respond(f"📋 **File Queued**\n\n📁 **File:** `{sanitized_filename}`\n📊 **Size:** {self.format_size(file_size)}\n🔢 **Position:** {queue_position}")
+        
+        await self.add_to_queue(user_id, upload_item)
 
     async def handle_url_upload(self, event):
-        """Handle URL download and upload using streaming"""
+        """Handle URL upload by adding to queue"""
         user_id = event.sender_id
         url = event.message.text.strip()
         
@@ -249,43 +370,23 @@ class TelegramBot:
         if sanitized_filename != filename:
             logger.info(f"Sanitized filename: '{filename}' -> '{sanitized_filename}'")
         
-        logger.info(f"Downloading from URL: {url}")
+        logger.info(f"Queuing URL: {url}")
         
-        self.active_uploads[user_id] = {
+        # Add to queue
+        upload_item = {
+            'type': 'url',
+            'event': event,
+            'url': url,
             'filename': sanitized_filename,
-            'status': 'Starting download...'
+            'user_id': user_id
         }
-
-        progress_msg = await event.respond("📥 **Downloading from URL...**\n⏳ Starting...")
         
-        # Use temporary file for streaming
-        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-            try:
-                # Download from URL with progress to temporary file
-                file_size = await self.download_from_url_streaming(url, temp_file, progress_msg, sanitized_filename)
-                
-                # Upload to GitHub from temporary file
-                await progress_msg.edit("📤 **Uploading to GitHub...**\n⏳ Starting...")
-                download_url = await self.upload_to_github_streaming(temp_file.name, sanitized_filename, file_size, progress_msg)
-                
-                await progress_msg.edit(
-                    f"✅ **Upload Complete!**\n\n"
-                    f"📁 **File:** `{sanitized_filename}`\n"
-                    f"📊 **Size:** {self.format_size(file_size)}\n"
-                    f"🔗 **Download URL:**\n{download_url}"
-                )
-                
-            except Exception as e:
-                logger.error(f"Error processing URL: {e}")
-                await progress_msg.edit(f"❌ **Upload Failed**\n\nError: {str(e)}")
-            finally:
-                # Clean up temporary file
-                try:
-                    os.unlink(temp_file.name)
-                except:
-                    pass
-                if user_id in self.active_uploads:
-                    del self.active_uploads[user_id]
+        queue_position = len(self.upload_queues.get(user_id, [])) + 1
+        await event.respond(f"📋 **URL Queued**\n\n🔗 **URL:** `{url}`\n📁 **File:** `{sanitized_filename}`\n🔢 **Position:** {queue_position}")
+        
+        await self.add_to_queue(user_id, upload_item)
+
+    # ... keep existing code (download_telegram_file_streaming, download_from_url_streaming, upload_to_github_streaming, format_size methods)
 
     async def download_telegram_file_streaming(self, document, temp_file, progress_msg, filename: str):
         """Download file from Telegram with progress and speed using streaming to temp file"""
