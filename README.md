@@ -1,73 +1,184 @@
-# Welcome to your Lovable project
 
-## Project info
+# Telegram GitHub Release Uploader Bot
 
-**URL**: https://lovable.dev/projects/25f899ca-c813-450c-8ee7-6333a3a72c55
+A Telegram bot that uploads files to GitHub releases with real-time progress tracking and speed monitoring.
 
-## How can I edit this code?
+## Features
 
-There are several ways of editing your application.
+- 📤 Upload files directly from Telegram to GitHub releases
+- 🌐 Download files from URLs and upload to GitHub
+- 📊 Real-time progress tracking with upload/download speeds
+- 💾 Memory-efficient streaming for large files (up to 4GB)
+- ⚡ Production-ready with Gunicorn WSGI server
+- 🐳 Docker and Docker Compose support
 
-**Use Lovable**
+## Prerequisites
 
-Simply visit the [Lovable Project](https://lovable.dev/projects/25f899ca-c813-450c-8ee7-6333a3a72c55) and start prompting.
+1. **Telegram Bot Token**: Create a bot via [@BotFather](https://t.me/BotFather)
+2. **Telegram API Credentials**: Get from [my.telegram.org](https://my.telegram.org)
+3. **GitHub Personal Access Token**: Create with `repo` permissions
+4. **GitHub Repository**: Must have a release with the specified tag
 
-Changes made via Lovable will be committed automatically to this repo.
+## Quick Start
 
-**Use your preferred IDE**
+### Using Docker Compose (Recommended)
 
-If you want to work locally using your own IDE, you can clone this repo and push changes. Pushed changes will also be reflected in Lovable.
-
-The only requirement is having Node.js & npm installed - [install with nvm](https://github.com/nvm-sh/nvm#installing-and-updating)
-
-Follow these steps:
-
-```sh
-# Step 1: Clone the repository using the project's Git URL.
-git clone <YOUR_GIT_URL>
-
-# Step 2: Navigate to the project directory.
-cd <YOUR_PROJECT_NAME>
-
-# Step 3: Install the necessary dependencies.
-npm i
-
-# Step 4: Start the development server with auto-reloading and an instant preview.
-npm run dev
+1. Clone this repository:
+```bash
+git clone <your-repo-url>
+cd telegram-github-bot
 ```
 
-**Edit a file directly in GitHub**
+2. Copy environment file and configure:
+```bash
+cp .env.example .env
+# Edit .env with your credentials
+```
 
-- Navigate to the desired file(s).
-- Click the "Edit" button (pencil icon) at the top right of the file view.
-- Make your changes and commit the changes.
+3. Start the bot:
+```bash
+docker-compose up -d
+```
 
-**Use GitHub Codespaces**
+### Using Docker
 
-- Navigate to the main page of your repository.
-- Click on the "Code" button (green button) near the top right.
-- Select the "Codespaces" tab.
-- Click on "New codespace" to launch a new Codespace environment.
-- Edit files directly within the Codespace and commit and push your changes once you're done.
+1. Build the image:
+```bash
+docker build -t telegram-github-bot .
+```
 
-## What technologies are used for this project?
+2. Run the container:
+```bash
+docker run -d \
+  --name telegram-github-bot \
+  -p 5000:5000 \
+  -e TELEGRAM_API_ID=your_api_id \
+  -e TELEGRAM_API_HASH=your_api_hash \
+  -e TELEGRAM_BOT_TOKEN=your_bot_token \
+  -e GITHUB_TOKEN=your_github_token \
+  -e GITHUB_REPO=username/repository \
+  -e GITHUB_RELEASE_TAG=v1.0.0 \
+  telegram-github-bot
+```
 
-This project is built with:
+### Local Development
 
-- Vite
-- TypeScript
-- React
-- shadcn-ui
-- Tailwind CSS
+1. Install dependencies:
+```bash
+pip install -r requirements.txt
+```
 
-## How can I deploy this project?
+2. Set environment variables or create `.env` file
 
-Simply open [Lovable](https://lovable.dev/projects/25f899ca-c813-450c-8ee7-6333a3a72c55) and click on Share -> Publish.
+3. Run the bot:
+```bash
+python run.py
+```
 
-## Can I connect a custom domain to my Lovable project?
+## Configuration
 
-Yes, you can!
+### Environment Variables
 
-To connect a domain, navigate to Project > Settings > Domains and click Connect Domain.
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `TELEGRAM_API_ID` | Telegram API ID from my.telegram.org | Yes |
+| `TELEGRAM_API_HASH` | Telegram API Hash from my.telegram.org | Yes |
+| `TELEGRAM_BOT_TOKEN` | Bot token from @BotFather | Yes |
+| `GITHUB_TOKEN` | GitHub Personal Access Token | Yes |
+| `GITHUB_REPO` | Target repository (format: username/repo) | Yes |
+| `GITHUB_RELEASE_TAG` | Release tag to upload to | Yes |
+| `LOG_LEVEL` | Logging level (INFO, DEBUG, ERROR) | No (default: INFO) |
 
-Read more here: [Setting up a custom domain](https://docs.lovable.dev/tips-tricks/custom-domain#step-by-step-guide)
+### GitHub Setup
+
+1. Create a Personal Access Token:
+   - Go to GitHub Settings → Developer settings → Personal access tokens
+   - Generate new token with `repo` scope
+   - Copy the token
+
+2. Create a release in your repository:
+   - Go to your repository → Releases → Create a new release
+   - Set a tag (e.g., `v1.0.0`)
+   - Publish the release
+
+## Usage
+
+### Bot Commands
+
+- `/start` - Show welcome message and instructions
+- `/help` - Show detailed help information
+- `/status` - Check current upload status
+
+### File Upload
+
+1. Send any file directly to the bot (up to 4GB)
+2. Bot will download from Telegram and upload to GitHub
+3. Returns the download URL when complete
+
+### URL Upload
+
+1. Send a direct download URL to the bot
+2. Bot will download the file and upload to GitHub
+3. Returns the download URL when complete
+
+## Features
+
+### Real-time Progress Tracking
+- Download progress from Telegram/URL
+- Upload progress to GitHub
+- Speed monitoring (MB/s)
+- Visual progress bars
+
+### Memory Efficiency
+- Streaming downloads and uploads
+- No full file loading into memory
+- Supports large files up to 4GB
+
+### Production Ready
+- Gunicorn WSGI server
+- Proper logging
+- Error handling
+- Docker support
+
+## API Endpoints
+
+- `GET /` - Health check endpoint
+- Returns: "Free Storage Server Working"
+
+## Logs
+
+Logs are written to:
+- Console output
+- `bot.log` file (when running locally)
+- Container logs (when using Docker)
+
+## Troubleshooting
+
+### Common Issues
+
+1. **Bot not responding**: Check bot token and network connectivity
+2. **GitHub upload fails**: Verify token permissions and release exists
+3. **Large file upload fails**: Check available disk space and memory
+4. **Speed issues**: Ensure good network connectivity
+
+### Debug Mode
+
+Set `LOG_LEVEL=DEBUG` for verbose logging.
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Submit a pull request
+
+## License
+
+This project is licensed under the MIT License.
+
+## Support
+
+For issues and questions:
+1. Check the troubleshooting section
+2. Review logs for error details
+3. Create an issue on GitHub

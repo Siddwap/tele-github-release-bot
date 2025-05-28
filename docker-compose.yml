@@ -1,0 +1,31 @@
+
+version: '3.8'
+
+services:
+  telegram-bot:
+    build: .
+    container_name: telegram-github-bot
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID}
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GITHUB_REPO=${GITHUB_REPO}
+      - GITHUB_RELEASE_TAG=${GITHUB_RELEASE_TAG}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./sessions:/app/sessions
+      - ./logs:/app/logs
+    networks:
+      - bot-network
+
+networks:
+  bot-network:
+    driver: bridge
+
+volumes:
+  sessions:
+  logs:
