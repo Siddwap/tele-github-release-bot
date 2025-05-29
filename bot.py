@@ -393,9 +393,6 @@ class TelegramBot:
         last_update_time = start_time
         last_downloaded = 0
         
-        # Increased chunk size for better performance
-        chunk_size = 8 * 1024 * 1024  # 8MB chunks instead of default
-        
         async def progress_callback(current, total):
             nonlocal downloaded, last_update_time, last_downloaded
             downloaded = current
@@ -421,12 +418,11 @@ class TelegramBot:
                 last_update_time = current_time
                 last_downloaded = current
         
-        # Download file to temporary file using streaming with optimized chunk size
+        # Download file to temporary file using streaming (removed unsupported chunk_size parameter)
         await self.client.download_media(
             document, 
             file=temp_file, 
-            progress_callback=progress_callback,
-            chunk_size=chunk_size
+            progress_callback=progress_callback
         )
 
     async def download_from_url_streaming(self, url: str, temp_file, progress_msg, filename: str) -> int:
