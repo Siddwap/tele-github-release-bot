@@ -1,3 +1,4 @@
+
 import aiohttp
 import logging
 from typing import Callable, Optional, List, Dict
@@ -188,4 +189,47 @@ class GitHubUploader:
                         
         except Exception as e:
             logger.error(f"Error deleting asset: {e}")
+            raise
+
+    async def rename_asset(self, old_filename: str, new_filename: str) -> bool:
+        """Rename an asset by downloading and re-uploading with new name"""
+        try:
+            assets = await self.list_release_assets()
+            
+            # Find the asset with matching filename
+            target_asset = None
+            for asset in assets:
+                if asset['name'] == old_filename:
+                    target_asset = asset
+                    break
+            
+            if not target_asset:
+                return False
+            
+            # Download the asset content
+            download_url = target_asset['browser_download_url']
+            headers = {
+                "Authorization": f"token {self.token}",
+                "Accept": "application/octet-stream"
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                # Download the file content
+                async with session.get(download_url) as download_response:
+                    if download_response.status != 200:
+                        raise Exception(f"Failed to download asset: HTTP {download_response.status}")
+                    
+                    file_content = await download_response.read()
+                
+                # Upload with new name
+                await self.upload_asset(file_content, new_filename)
+                
+                # Delete the old asset
+                await self.delete_asset_by_name(old_filename)
+                
+                logger.info(f"Successfully renamed asset: '{old_filename}' -> '{new_filename}'")
+                return True
+                        
+        except Exception as e:
+            logger.error(f"Error renaming asset: {e}")
             raise

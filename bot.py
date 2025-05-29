@@ -217,7 +217,8 @@ class TelegramBot:
                 "• /queue - Check queue status\n"
                 "• /list [page] - List files in release (20 per page)\n"
                 "• /search <filename> - Search files by name\n"
-                "• /delete <number> - Delete file by list number"
+                "• /delete <number> - Delete file by list number\n"
+                "• /rename <number> <new_filename> - Rename file by list number"
             )
             raise events.StopPropagation
 
@@ -231,12 +232,14 @@ class TelegramBot:
                 "**Management:**\n"
                 "• /list [page] - See uploaded files (20 per page)\n"
                 "• /search <filename> - Search files by name\n"
-                "• /delete <number> - Remove file by list number\n\n"
+                "• /delete <number> - Remove file by list number\n"
+                "• /rename <number> <new_filename> - Rename file by list number\n\n"
                 "**Examples:**\n"
                 "• /list - Show first page of files\n"
                 "• /list 2 - Show page 2 of files\n"
                 "• /search video.mp4 - Find files containing 'video.mp4'\n"
-                "• /delete 5 - Delete file number 5 from list\n\n"
+                "• /delete 5 - Delete file number 5 from list\n"
+                "• /rename 5 new_video.mp4 - Rename file number 5\n\n"
                 "**Features:**\n"
                 "• Supports files up to 4GB\n"
                 "• Real-time progress updates with speed\n"
@@ -399,6 +402,63 @@ class TelegramBot:
                 await event.respond("❌ **Invalid file number**\n\nPlease provide a valid number")
             except Exception as e:
                 await event.respond(f"❌ **Error deleting file**\n\n{str(e)}")
+            raise events.StopPropagation
+
+        @self.client.on(events.NewMessage(pattern=r'/rename (\d+) (.+)'))
+        async def rename_handler(event):
+            try:
+                file_number = int(event.pattern_match.group(1))
+                new_filename = event.pattern_match.group(2).strip()
+                
+                if file_number < 1:
+                    await event.respond("❌ **Invalid file number**\n\nFile numbers start from 1")
+                    return
+                
+                if not new_filename:
+                    await event.respond("❌ **Invalid filename**\n\nPlease provide a valid new filename")
+                    return
+                
+                # Sanitize the new filename
+                sanitized_filename = self.sanitize_filename(new_filename)
+                if sanitized_filename != new_filename:
+                    await event.respond(f"ℹ️ **Filename sanitized:** `{new_filename}` -> `{sanitized_filename}`")
+                
+                assets = await self.github_uploader.list_release_assets()
+                if not assets:
+                    await event.respond("📂 **No files found in release**")
+                    return
+                
+                if file_number > len(assets):
+                    await event.respond(f"❌ **File number {file_number} not found**\n\nTotal files: {len(assets)}")
+                    return
+                
+                # Get the asset to rename (subtract 1 for 0-based indexing)
+                target_asset = assets[file_number - 1]
+                old_filename = target_asset['name']
+                
+                # Check if new filename already exists
+                for asset in assets:
+                    if asset['name'] == sanitized_filename:
+                        await event.respond(f"❌ **Filename already exists**\n\n📁 **File:** `{sanitized_filename}`")
+                        return
+                
+                progress_msg = await event.respond(f"🔄 **Renaming file...**\n\n📁 **From:** `{old_filename}`\n📁 **To:** `{sanitized_filename}`")
+                
+                success = await self.github_uploader.rename_asset(old_filename, sanitized_filename)
+                if success:
+                    await progress_msg.edit(
+                        f"✅ **File renamed successfully**\n\n"
+                        f"📁 **File #{file_number}**\n"
+                        f"🔄 **From:** `{old_filename}`\n"
+                        f"🔄 **To:** `{sanitized_filename}`"
+                    )
+                else:
+                    await progress_msg.edit(f"❌ **Failed to rename file**\n\n📁 **File:** `{old_filename}`")
+                    
+            except ValueError:
+                await event.respond("❌ **Invalid command format**\n\nUsage: /rename <number> <new_filename>")
+            except Exception as e:
+                await event.respond(f"❌ **Error renaming file**\n\n{str(e)}")
             raise events.StopPropagation
 
         @self.client.on(events.NewMessage)
