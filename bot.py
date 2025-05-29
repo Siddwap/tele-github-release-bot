@@ -214,7 +214,9 @@ class TelegramBot:
                 "• Send a URL to download and upload\n"
                 "• /help - Show this message\n"
                 "• /status - Check upload status\n"
-                "• /queue - Check queue status"
+                "• /queue - Check queue status\n"
+                "• /list - List all files in release\n"
+                "• /delete <filename> - Delete a file from release"
             )
             raise events.StopPropagation
 
@@ -225,6 +227,9 @@ class TelegramBot:
                 "1. **File Upload**: Send any file directly to the bot\n"
                 "2. **URL Upload**: Send a URL pointing to a file\n"
                 "3. **Batch Upload**: Send multiple files/URLs - they'll queue automatically\n\n"
+                "**Management:**\n"
+                "• /list - See all uploaded files\n"
+                "• /delete <filename> - Remove a file from release\n\n"
                 "**Features:**\n"
                 "• Supports files up to 4GB\n"
                 "• Real-time progress updates with speed\n"
@@ -262,6 +267,46 @@ class TelegramBot:
                 await event.respond(f"📋 **Upload Queue ({queue_count} items):**\n\n{queue_text}")
             else:
                 await event.respond("📋 Queue is empty")
+            raise events.StopPropagation
+
+        @self.client.on(events.NewMessage(pattern='/list'))
+        async def list_handler(event):
+            try:
+                assets = await self.github_uploader.list_release_assets()
+                if not assets:
+                    await event.respond("📂 **No files found in release**")
+                    return
+                
+                response = f"📂 **Files in Release ({len(assets)} total):**\n\n"
+                for i, asset in enumerate(assets[:20], 1):  # Show first 20 files
+                    size_mb = asset['size'] / (1024 * 1024)
+                    response += f"{i}. **{asset['name']}**\n"
+                    response += f"   📊 Size: {size_mb:.1f} MB\n"
+                    response += f"   🔗 [Download]({asset['browser_download_url']})\n\n"
+                
+                if len(assets) > 20:
+                    response += f"... and {len(assets) - 20} more files"
+                
+                await event.respond(response)
+            except Exception as e:
+                await event.respond(f"❌ **Error listing files**\n\n{str(e)}")
+            raise events.StopPropagation
+
+        @self.client.on(events.NewMessage(pattern=r'/delete (.+)'))
+        async def delete_handler(event):
+            filename = event.pattern_match.group(1).strip()
+            if not filename:
+                await event.respond("❌ **Usage:** /delete <filename>")
+                return
+            
+            try:
+                success = await self.github_uploader.delete_asset_by_name(filename)
+                if success:
+                    await event.respond(f"✅ **File deleted successfully**\n\n📁 **File:** `{filename}`")
+                else:
+                    await event.respond(f"❌ **File not found**\n\n📁 **File:** `{filename}`")
+            except Exception as e:
+                await event.respond(f"❌ **Error deleting file**\n\n{str(e)}")
             raise events.StopPropagation
 
         @self.client.on(events.NewMessage)

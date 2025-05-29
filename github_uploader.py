@@ -1,7 +1,6 @@
-
 import aiohttp
 import logging
-from typing import Callable, Optional
+from typing import Callable, Optional, List, Dict
 import json
 import io
 import os
@@ -131,3 +130,62 @@ class GitHubUploader:
                 return await self.upload_asset_streaming(temp_file.name, filename, len(file_data), progress_callback)
             finally:
                 os.unlink(temp_file.name)
+
+    async def list_release_assets(self) -> List[Dict]:
+        """List all assets in the release"""
+        try:
+            release_info = await self.get_release_info()
+            release_id = release_info['id']
+            
+            url = f"{self.api_url}/repos/{self.repo}/releases/{release_id}/assets"
+            headers = {
+                "Authorization": f"token {self.token}",
+                "Accept": "application/vnd.github.v3+json"
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers) as response:
+                    if response.status != 200:
+                        raise Exception(f"Failed to list assets: HTTP {response.status}")
+                    
+                    assets = await response.json()
+                    return assets
+                    
+        except Exception as e:
+            logger.error(f"Error listing assets: {e}")
+            raise
+
+    async def delete_asset_by_name(self, filename: str) -> bool:
+        """Delete an asset by filename"""
+        try:
+            assets = await self.list_release_assets()
+            
+            # Find the asset with matching filename
+            target_asset = None
+            for asset in assets:
+                if asset['name'] == filename:
+                    target_asset = asset
+                    break
+            
+            if not target_asset:
+                return False
+            
+            # Delete the asset
+            url = f"{self.api_url}/repos/{self.repo}/releases/assets/{target_asset['id']}"
+            headers = {
+                "Authorization": f"token {self.token}",
+                "Accept": "application/vnd.github.v3+json"
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.delete(url, headers=headers) as response:
+                    if response.status == 204:
+                        logger.info(f"Successfully deleted asset: {filename}")
+                        return True
+                    else:
+                        logger.error(f"Failed to delete asset: HTTP {response.status}")
+                        return False
+                        
+        except Exception as e:
+            logger.error(f"Error deleting asset: {e}")
+            raise
