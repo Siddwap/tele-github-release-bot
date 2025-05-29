@@ -215,8 +215,9 @@ class TelegramBot:
                 "• /help - Show this message\n"
                 "• /status - Check upload status\n"
                 "• /queue - Check queue status\n"
-                "• /list - List all files in release\n"
-                "• /delete <filename> - Delete a file from release"
+                "• /list [page] - List files in release (20 per page)\n"
+                "• /search <filename> - Search files by name\n"
+                "• /delete <number> - Delete file by list number"
             )
             raise events.StopPropagation
 
@@ -228,8 +229,14 @@ class TelegramBot:
                 "2. **URL Upload**: Send a URL pointing to a file\n"
                 "3. **Batch Upload**: Send multiple files/URLs - they'll queue automatically\n\n"
                 "**Management:**\n"
-                "• /list - See all uploaded files\n"
-                "• /delete <filename> - Remove a file from release\n\n"
+                "• /list [page] - See uploaded files (20 per page)\n"
+                "• /search <filename> - Search files by name\n"
+                "• /delete <number> - Remove file by list number\n\n"
+                "**Examples:**\n"
+                "• /list - Show first page of files\n"
+                "• /list 2 - Show page 2 of files\n"
+                "• /search video.mp4 - Find files containing 'video.mp4'\n"
+                "• /delete 5 - Delete file number 5 from list\n\n"
                 "**Features:**\n"
                 "• Supports files up to 4GB\n"
                 "• Real-time progress updates with speed\n"
@@ -269,42 +276,127 @@ class TelegramBot:
                 await event.respond("📋 Queue is empty")
             raise events.StopPropagation
 
-        @self.client.on(events.NewMessage(pattern='/list'))
+        @self.client.on(events.NewMessage(pattern=r'/list(?:\s+(\d+))?'))
         async def list_handler(event):
             try:
+                # Get page number from command (default to 1)
+                page_match = event.pattern_match.group(1)
+                page = int(page_match) if page_match else 1
+                
                 assets = await self.github_uploader.list_release_assets()
                 if not assets:
                     await event.respond("📂 **No files found in release**")
                     return
                 
-                response = f"📂 **Files in Release ({len(assets)} total):**\n\n"
-                for i, asset in enumerate(assets[:20], 1):  # Show first 20 files
+                # Pagination logic
+                per_page = 20
+                total_pages = (len(assets) + per_page - 1) // per_page
+                start_idx = (page - 1) * per_page
+                end_idx = start_idx + per_page
+                page_assets = assets[start_idx:end_idx]
+                
+                if not page_assets:
+                    await event.respond(f"📂 **Page {page} not found**\n\nTotal pages: {total_pages}")
+                    return
+                
+                response = f"📂 **Files in Release (Page {page}/{total_pages}):**\n\n"
+                
+                for i, asset in enumerate(page_assets, start=start_idx + 1):
                     size_mb = asset['size'] / (1024 * 1024)
-                    response += f"{i}. **{asset['name']}**\n"
+                    response += f"**{i}.** `{asset['name']}`\n"
                     response += f"   📊 Size: {size_mb:.1f} MB\n"
                     response += f"   🔗 [Download]({asset['browser_download_url']})\n\n"
                 
-                if len(assets) > 20:
-                    response += f"... and {len(assets) - 20} more files"
+                # Add navigation info
+                nav_info = f"📄 **Total:** {len(assets)} files | **Page:** {page}/{total_pages}\n"
+                if page < total_pages:
+                    nav_info += f"📄 Use `/list {page + 1}` for next page\n"
+                if page > 1:
+                    nav_info += f"📄 Use `/list {page - 1}` for previous page\n"
+                nav_info += f"🗑️ Use `/delete <number>` to delete a file"
                 
+                response += nav_info
                 await event.respond(response)
+                
             except Exception as e:
                 await event.respond(f"❌ **Error listing files**\n\n{str(e)}")
             raise events.StopPropagation
 
-        @self.client.on(events.NewMessage(pattern=r'/delete (.+)'))
-        async def delete_handler(event):
-            filename = event.pattern_match.group(1).strip()
-            if not filename:
-                await event.respond("❌ **Usage:** /delete <filename>")
-                return
-            
+        @self.client.on(events.NewMessage(pattern=r'/search (.+)'))
+        async def search_handler(event):
             try:
+                search_term = event.pattern_match.group(1).strip().lower()
+                if not search_term:
+                    await event.respond("❌ **Usage:** /search <filename>")
+                    return
+                
+                assets = await self.github_uploader.list_release_assets()
+                if not assets:
+                    await event.respond("📂 **No files found in release**")
+                    return
+                
+                # Filter assets by search term
+                matching_assets = []
+                for i, asset in enumerate(assets, 1):
+                    if search_term in asset['name'].lower():
+                        matching_assets.append((i, asset))
+                
+                if not matching_assets:
+                    await event.respond(f"🔍 **No files found matching:** `{search_term}`")
+                    return
+                
+                response = f"🔍 **Search Results for:** `{search_term}`\n\n"
+                
+                for original_num, asset in matching_assets[:20]:  # Limit to 20 results
+                    size_mb = asset['size'] / (1024 * 1024)
+                    response += f"**{original_num}.** `{asset['name']}`\n"
+                    response += f"   📊 Size: {size_mb:.1f} MB\n"
+                    response += f"   🔗 [Download]({asset['browser_download_url']})\n\n"
+                
+                if len(matching_assets) > 20:
+                    response += f"... and {len(matching_assets) - 20} more results\n\n"
+                
+                response += f"📊 **Found:** {len(matching_assets)} files\n"
+                response += f"🗑️ Use `/delete <number>` to delete a file"
+                
+                await event.respond(response)
+                
+            except Exception as e:
+                await event.respond(f"❌ **Error searching files**\n\n{str(e)}")
+            raise events.StopPropagation
+
+        @self.client.on(events.NewMessage(pattern=r'/delete (\d+)'))
+        async def delete_handler(event):
+            try:
+                file_number = int(event.pattern_match.group(1))
+                if file_number < 1:
+                    await event.respond("❌ **Invalid file number**\n\nFile numbers start from 1")
+                    return
+                
+                assets = await self.github_uploader.list_release_assets()
+                if not assets:
+                    await event.respond("📂 **No files found in release**")
+                    return
+                
+                if file_number > len(assets):
+                    await event.respond(f"❌ **File number {file_number} not found**\n\nTotal files: {len(assets)}")
+                    return
+                
+                # Get the asset to delete (subtract 1 for 0-based indexing)
+                target_asset = assets[file_number - 1]
+                filename = target_asset['name']
+                
                 success = await self.github_uploader.delete_asset_by_name(filename)
                 if success:
-                    await event.respond(f"✅ **File deleted successfully**\n\n📁 **File:** `{filename}`")
+                    await event.respond(
+                        f"✅ **File deleted successfully**\n\n"
+                        f"🗑️ **File #{file_number}:** `{filename}`"
+                    )
                 else:
-                    await event.respond(f"❌ **File not found**\n\n📁 **File:** `{filename}`")
+                    await event.respond(f"❌ **Failed to delete file**\n\n📁 **File:** `{filename}`")
+                    
+            except ValueError:
+                await event.respond("❌ **Invalid file number**\n\nPlease provide a valid number")
             except Exception as e:
                 await event.respond(f"❌ **Error deleting file**\n\n{str(e)}")
             raise events.StopPropagation
