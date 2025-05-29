@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 import os
@@ -386,15 +385,16 @@ class TelegramBot:
         
         await self.add_to_queue(user_id, upload_item)
 
-    # ... keep existing code (download_telegram_file_streaming, download_from_url_streaming, upload_to_github_streaming, format_size methods)
-
     async def download_telegram_file_streaming(self, document, temp_file, progress_msg, filename: str):
-        """Download file from Telegram with progress and speed using streaming to temp file"""
+        """Download file from Telegram with progress and speed using streaming to temp file - OPTIMIZED"""
         total_size = document.size
         downloaded = 0
         start_time = time.time()
         last_update_time = start_time
         last_downloaded = 0
+        
+        # Increased chunk size for better performance
+        chunk_size = 8 * 1024 * 1024  # 8MB chunks instead of default
         
         async def progress_callback(current, total):
             nonlocal downloaded, last_update_time, last_downloaded
@@ -421,12 +421,33 @@ class TelegramBot:
                 last_update_time = current_time
                 last_downloaded = current
         
-        # Download file to temporary file using streaming
-        await self.client.download_media(document, file=temp_file, progress_callback=progress_callback)
+        # Download file to temporary file using streaming with optimized chunk size
+        await self.client.download_media(
+            document, 
+            file=temp_file, 
+            progress_callback=progress_callback,
+            chunk_size=chunk_size
+        )
 
     async def download_from_url_streaming(self, url: str, temp_file, progress_msg, filename: str) -> int:
-        """Download file from URL with progress and speed using streaming to temp file"""
-        async with aiohttp.ClientSession() as session:
+        """Download file from URL with progress and speed using streaming to temp file - OPTIMIZED"""
+        # Optimized aiohttp session with better settings for high-speed downloads
+        timeout = aiohttp.ClientTimeout(total=None, connect=30)
+        connector = aiohttp.TCPConnector(
+            limit=100,
+            limit_per_host=30,
+            ttl_dns_cache=300,
+            use_dns_cache=True,
+            enable_cleanup_closed=True
+        )
+        
+        async with aiohttp.ClientSession(
+            timeout=timeout,
+            connector=connector,
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+        ) as session:
             async with session.get(url) as response:
                 if response.status != 200:
                     raise Exception(f"Failed to download: HTTP {response.status}")
@@ -437,7 +458,10 @@ class TelegramBot:
                 last_update_time = start_time
                 last_downloaded = 0
                 
-                async for chunk in response.content.iter_chunked(1024 * 1024):  # 1MB chunks
+                # Increased chunk size for better performance
+                chunk_size = 8 * 1024 * 1024  # 8MB chunks
+                
+                async for chunk in response.content.iter_chunked(chunk_size):
                     temp_file.write(chunk)
                     downloaded += len(chunk)
                     current_time = time.time()
