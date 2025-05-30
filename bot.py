@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 import os
@@ -39,6 +38,7 @@ class TelegramBot:
         self.upload_queues: Dict[int, deque] = {}  # User ID -> queue of uploads
         self.processing_queues: Dict[int, bool] = {}  # User ID -> is processing
         self.should_stop = False  # Flag to control stopping processes
+        self.active_sessions: Dict[int, List] = {}  # User ID -> list of active aiohttp sessions
 
     def is_admin(self, user_id: int) -> bool:
         """Check if user is admin"""
@@ -47,6 +47,14 @@ class TelegramBot:
     async def stop_all_processes(self):
         """Stop all running processes"""
         self.should_stop = True
+        
+        # Cancel all active aiohttp sessions
+        for user_id, sessions in self.active_sessions.items():
+            for session in sessions:
+                if not session.closed:
+                    await session.close()
+        self.active_sessions.clear()
+        
         # Clear all queues
         for user_id in list(self.upload_queues.keys()):
             self.upload_queues[user_id].clear()
@@ -64,6 +72,17 @@ class TelegramBot:
         """Restart all processes"""
         self.should_stop = False
         logger.info("All processes restarted by admin command")
+
+    def add_active_session(self, user_id: int, session):
+        """Add an active session for tracking"""
+        if user_id not in self.active_sessions:
+            self.active_sessions[user_id] = []
+        self.active_sessions[user_id].append(session)
+
+    def remove_active_session(self, user_id: int, session):
+        """Remove an active session"""
+        if user_id in self.active_sessions and session in self.active_sessions[user_id]:
+            self.active_sessions[user_id].remove(session)
 
     def sanitize_filename(self, filename: str) -> str:
         """Sanitize filename by replacing special characters while preserving extension"""
@@ -279,7 +298,7 @@ class TelegramBot:
                 "• /list - Browse files with navigation buttons\n"
                 "• /search <filename> - Search files by name\n"
                 "• /delete <number> - Remove file by list number\n"
-                "• /rename <number> <new_filename> - Rename file by list number\n"
+                "• /rename <number> <new_name> - Rename file by list number\n"
                 "• /stop - Stop all running processes\n"
                 "• /restart - Restart all processes\n\n"
                 "**Examples:**\n"
@@ -351,7 +370,7 @@ class TelegramBot:
                 raise events.StopPropagation
             
             try:
-                await self.send_file_list(event, page=1)
+                await send_file_list(event, page=1)
             except Exception as e:
                 await event.respond(f"❌ **Error listing files**\n\n{str(e)}")
             raise events.StopPropagation
@@ -367,13 +386,13 @@ class TelegramBot:
             
             if data.startswith('list_page_'):
                 page = int(data.split('_')[2])
-                await self.send_file_list(event, page, edit=True)
+                await send_file_list(event, page, edit=True)
                 await event.answer()
             elif data == 'close_list':
                 await event.delete()
                 await event.answer()
 
-        async def send_file_list(self, event, page=1, edit=False):
+        async def send_file_list(event, page=1, edit=False):
             """Send file list with pagination buttons"""
             assets = await self.github_uploader.list_release_assets()
             if not assets:
@@ -435,8 +454,6 @@ class TelegramBot:
 
         # Store the method in the class for access in callback handler
         self.send_file_list = send_file_list
-
-        # ... keep existing code (search_handler, delete_handler, rename_handler, message_handler)
 
         @self.client.on(events.NewMessage(pattern=r'/search (.+)'))
         async def search_handler(event):
@@ -644,8 +661,6 @@ class TelegramBot:
             return False
         return text.startswith(('http://', 'https://')) and len(text) > 8
 
-    # ... keep existing code (handle_file_upload, handle_url_upload, download methods, upload methods, format_size)
-
     async def handle_file_upload(self, event):
         """Handle file upload by adding to queue"""
         user_id = event.sender_id
@@ -727,6 +742,11 @@ class TelegramBot:
         
         async def progress_callback(current, total):
             nonlocal downloaded, last_update_time, last_downloaded
+            
+            # Check if we should stop
+            if self.should_stop:
+                raise Exception("Upload stopped by admin command")
+            
             downloaded = current
             current_time = time.time()
             progress = (current / total) * 100
@@ -750,7 +770,7 @@ class TelegramBot:
                 last_update_time = current_time
                 last_downloaded = current
         
-        # Download file to temporary file using streaming (removed unsupported chunk_size parameter)
+        # Download file to temporary file using streaming
         await self.client.download_media(
             document, 
             file=temp_file, 
@@ -769,13 +789,19 @@ class TelegramBot:
             enable_cleanup_closed=True
         )
         
-        async with aiohttp.ClientSession(
+        session = aiohttp.ClientSession(
             timeout=timeout,
             connector=connector,
             headers={
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             }
-        ) as session:
+        )
+        
+        # Track this session for potential cancellation
+        user_id = getattr(progress_msg, 'sender_id', 0)
+        self.add_active_session(user_id, session)
+        
+        try:
             async with session.get(url) as response:
                 if response.status != 200:
                     raise Exception(f"Failed to download: HTTP {response.status}")
@@ -790,6 +816,10 @@ class TelegramBot:
                 chunk_size = 8 * 1024 * 1024  # 8MB chunks
                 
                 async for chunk in response.content.iter_chunked(chunk_size):
+                    # Check if we should stop
+                    if self.should_stop:
+                        raise Exception("Upload stopped by admin command")
+                    
                     temp_file.write(chunk)
                     downloaded += len(chunk)
                     current_time = time.time()
@@ -818,6 +848,10 @@ class TelegramBot:
                 
                 temp_file.flush()
                 return downloaded
+        finally:
+            self.remove_active_session(user_id, session)
+            if not session.closed:
+                await session.close()
 
     async def upload_to_github_streaming(self, temp_file_path: str, filename: str, file_size: int, progress_msg) -> str:
         """Upload file to GitHub with progress and speed using streaming"""
@@ -828,6 +862,11 @@ class TelegramBot:
         
         async def progress_callback(current: int):
             nonlocal uploaded, last_update_time, last_uploaded
+            
+            # Check if we should stop
+            if self.should_stop:
+                raise Exception("Upload stopped by admin command")
+            
             uploaded = current
             current_time = time.time()
             progress = (current / file_size) * 100
