@@ -402,9 +402,6 @@ class TelegramBot:
                     await event.respond("📂 **No files found in release**")
                 return
             
-            # Reverse the order to show latest uploads first
-            assets = list(reversed(assets))
-            
             # Pagination logic
             per_page = 20
             total_pages = (len(assets) + per_page - 1) // per_page

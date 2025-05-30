@@ -1,4 +1,3 @@
-
 import aiohttp
 import logging
 from typing import Callable, Optional, List, Dict
@@ -133,7 +132,7 @@ class GitHubUploader:
                 os.unlink(temp_file.name)
 
     async def list_release_assets(self) -> List[Dict]:
-        """List all assets in the release with proper pagination"""
+        """List all assets in the release with proper pagination, sorted by upload time (latest first)"""
         try:
             release_info = await self.get_release_info()
             release_id = release_info['id']
@@ -171,6 +170,9 @@ class GitHubUploader:
                             break
                         
                         page += 1
+            
+            # Sort by created_at timestamp in descending order (latest first)
+            all_assets.sort(key=lambda asset: asset.get('created_at', ''), reverse=True)
             
             return all_assets
                     
