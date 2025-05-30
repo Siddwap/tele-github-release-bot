@@ -133,24 +133,46 @@ class GitHubUploader:
                 os.unlink(temp_file.name)
 
     async def list_release_assets(self) -> List[Dict]:
-        """List all assets in the release"""
+        """List all assets in the release with proper pagination"""
         try:
             release_info = await self.get_release_info()
             release_id = release_info['id']
             
-            url = f"{self.api_url}/repos/{self.repo}/releases/{release_id}/assets"
-            headers = {
-                "Authorization": f"token {self.token}",
-                "Accept": "application/vnd.github.v3+json"
-            }
+            all_assets = []
+            page = 1
+            per_page = 100  # Maximum allowed by GitHub API
             
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=headers) as response:
-                    if response.status != 200:
-                        raise Exception(f"Failed to list assets: HTTP {response.status}")
-                    
-                    assets = await response.json()
-                    return assets
+            while True:
+                url = f"{self.api_url}/repos/{self.repo}/releases/{release_id}/assets"
+                headers = {
+                    "Authorization": f"token {self.token}",
+                    "Accept": "application/vnd.github.v3+json"
+                }
+                params = {
+                    "page": page,
+                    "per_page": per_page
+                }
+                
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, headers=headers, params=params) as response:
+                        if response.status != 200:
+                            raise Exception(f"Failed to list assets: HTTP {response.status}")
+                        
+                        assets = await response.json()
+                        
+                        # If no assets returned, we've reached the end
+                        if not assets:
+                            break
+                        
+                        all_assets.extend(assets)
+                        
+                        # If we got fewer assets than requested, we've reached the end
+                        if len(assets) < per_page:
+                            break
+                        
+                        page += 1
+            
+            return all_assets
                     
         except Exception as e:
             logger.error(f"Error listing assets: {e}")

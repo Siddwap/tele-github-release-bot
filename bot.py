@@ -1,3 +1,4 @@
+
 import asyncio
 import logging
 import os
@@ -8,6 +9,7 @@ from collections import deque
 import aiohttp
 from telethon import TelegramClient, events
 from telethon.tl.types import DocumentAttributeFilename
+from telethon.tl.custom import Button
 from dotenv import load_dotenv
 from github_uploader import GitHubUploader
 from config import BotConfig
@@ -57,6 +59,11 @@ class TelegramBot:
         self.active_uploads.clear()
         
         logger.info("All processes stopped by admin command")
+
+    async def restart_all_processes(self):
+        """Restart all processes"""
+        self.should_stop = False
+        logger.info("All processes restarted by admin command")
 
     def sanitize_filename(self, filename: str) -> str:
         """Sanitize filename by replacing special characters while preserving extension"""
@@ -238,11 +245,12 @@ class TelegramBot:
                 "• /help - Show this message\n"
                 "• /status - Check upload status\n"
                 "• /queue - Check queue status\n" +
-                ("• /list [page] - List files in release (Admin only)\n"
+                ("• /list - List files in release with navigation (Admin only)\n"
                 "• /search <filename> - Search files by name (Admin only)\n"
                 "• /delete <number> - Delete file by list number (Admin only)\n"
                 "• /rename <number> <new_filename> - Rename file (Admin only)\n"
-                "• /stop - Stop all processes (Admin only)" if is_admin else "")
+                "• /stop - Stop all processes (Admin only)\n"
+                "• /restart - Restart all processes (Admin only)" if is_admin else "")
             )
             raise events.StopPropagation
 
@@ -268,14 +276,14 @@ class TelegramBot:
             
             admin_help = (
                 "\n\n**Admin Commands:**\n"
-                "• /list [page] - See uploaded files (20 per page)\n"
+                "• /list - Browse files with navigation buttons\n"
                 "• /search <filename> - Search files by name\n"
                 "• /delete <number> - Remove file by list number\n"
                 "• /rename <number> <new_filename> - Rename file by list number\n"
-                "• /stop - Stop all running processes\n\n"
+                "• /stop - Stop all running processes\n"
+                "• /restart - Restart all processes\n\n"
                 "**Examples:**\n"
-                "• /list - Show first page of files\n"
-                "• /list 2 - Show page 2 of files\n"
+                "• /list - Browse files with Previous/Next buttons\n"
                 "• /search video.mp4 - Find files containing 'video.mp4'\n"
                 "• /delete 5 - Delete file number 5 from list\n"
                 "• /rename 5 new_video.mp4 - Rename file number 5"
@@ -293,7 +301,18 @@ class TelegramBot:
                 raise events.StopPropagation
             
             await self.stop_all_processes()
-            await event.respond("🛑 **All processes stopped**\n\nAll uploads, queues, and active processes have been halted.")
+            await event.respond("🛑 **All processes stopped**\n\nAll uploads, queues, and active processes have been halted.\n\nUse /restart to resume operations.")
+            raise events.StopPropagation
+
+        @self.client.on(events.NewMessage(pattern='/restart'))
+        async def restart_handler(event):
+            user_id = event.sender_id
+            if not self.is_admin(user_id):
+                await event.respond("❌ **Access Denied**\n\nThis command is only available to administrators.")
+                raise events.StopPropagation
+            
+            await self.restart_all_processes()
+            await event.respond("✅ **Bot restarted successfully**\n\nAll processes are now running normally.")
             raise events.StopPropagation
 
         @self.client.on(events.NewMessage(pattern='/status'))
@@ -324,7 +343,7 @@ class TelegramBot:
                 await event.respond("📋 Queue is empty")
             raise events.StopPropagation
 
-        @self.client.on(events.NewMessage(pattern=r'/list(?:\s+(\d+))?'))
+        @self.client.on(events.NewMessage(pattern='/list'))
         async def list_handler(event):
             user_id = event.sender_id
             if not self.is_admin(user_id):
@@ -332,48 +351,92 @@ class TelegramBot:
                 raise events.StopPropagation
             
             try:
-                # Get page number from command (default to 1)
-                page_match = event.pattern_match.group(1)
-                page = int(page_match) if page_match else 1
-                
-                assets = await self.github_uploader.list_release_assets()
-                if not assets:
-                    await event.respond("📂 **No files found in release**")
-                    return
-                
-                # Pagination logic
-                per_page = 20
-                total_pages = (len(assets) + per_page - 1) // per_page
-                start_idx = (page - 1) * per_page
-                end_idx = start_idx + per_page
-                page_assets = assets[start_idx:end_idx]
-                
-                if not page_assets:
-                    await event.respond(f"📂 **Page {page} not found**\n\nTotal pages: {total_pages}")
-                    return
-                
-                response = f"📂 **Files in Release (Page {page}/{total_pages}):**\n\n"
-                
-                for i, asset in enumerate(page_assets, start=start_idx + 1):
-                    size_mb = asset['size'] / (1024 * 1024)
-                    response += f"**{i}.** `{asset['name']}`\n"
-                    response += f"   📊 Size: {size_mb:.1f} MB\n"
-                    response += f"   🔗 [Download]({asset['browser_download_url']})\n\n"
-                
-                # Add navigation info
-                nav_info = f"📄 **Total:** {len(assets)} files | **Page:** {page}/{total_pages}\n"
-                if page < total_pages:
-                    nav_info += f"📄 Use `/list {page + 1}` for next page\n"
-                if page > 1:
-                    nav_info += f"📄 Use `/list {page - 1}` for previous page\n"
-                nav_info += f"🗑️ Use `/delete <number>` to delete a file"
-                
-                response += nav_info
-                await event.respond(response)
-                
+                await self.send_file_list(event, page=1)
             except Exception as e:
                 await event.respond(f"❌ **Error listing files**\n\n{str(e)}")
             raise events.StopPropagation
+
+        @self.client.on(events.CallbackQuery)
+        async def callback_handler(event):
+            user_id = event.sender_id
+            if not self.is_admin(user_id):
+                await event.answer("Access denied", alert=True)
+                return
+            
+            data = event.data.decode('utf-8')
+            
+            if data.startswith('list_page_'):
+                page = int(data.split('_')[2])
+                await self.send_file_list(event, page, edit=True)
+                await event.answer()
+            elif data == 'close_list':
+                await event.delete()
+                await event.answer()
+
+        async def send_file_list(self, event, page=1, edit=False):
+            """Send file list with pagination buttons"""
+            assets = await self.github_uploader.list_release_assets()
+            if not assets:
+                if edit:
+                    await event.edit("📂 **No files found in release**")
+                else:
+                    await event.respond("📂 **No files found in release**")
+                return
+            
+            # Pagination logic
+            per_page = 20
+            total_pages = (len(assets) + per_page - 1) // per_page
+            start_idx = (page - 1) * per_page
+            end_idx = start_idx + per_page
+            page_assets = assets[start_idx:end_idx]
+            
+            if not page_assets:
+                if edit:
+                    await event.edit(f"📂 **Page {page} not found**\n\nTotal pages: {total_pages}")
+                else:
+                    await event.respond(f"📂 **Page {page} not found**\n\nTotal pages: {total_pages}")
+                return
+            
+            response = f"📂 **Files in Release (Page {page}/{total_pages}):**\n\n"
+            
+            for i, asset in enumerate(page_assets, start=start_idx + 1):
+                size_mb = asset['size'] / (1024 * 1024)
+                response += f"**{i}.** `{asset['name']}`\n"
+                response += f"   📊 Size: {size_mb:.1f} MB\n"
+                response += f"   🔗 [Download]({asset['browser_download_url']})\n\n"
+            
+            # Add total info
+            response += f"📄 **Total:** {len(assets)} files | **Page:** {page}/{total_pages}\n"
+            response += f"🗑️ Use `/delete <number>` to delete a file\n"
+            response += f"✏️ Use `/rename <number> <new_name>` to rename a file"
+            
+            # Create navigation buttons
+            buttons = []
+            nav_row = []
+            
+            # Previous page button
+            if page > 1:
+                nav_row.append(Button.inline("◀️ Previous", f"list_page_{page-1}"))
+            
+            # Next page button
+            if page < total_pages:
+                nav_row.append(Button.inline("Next ▶️", f"list_page_{page+1}"))
+            
+            if nav_row:
+                buttons.append(nav_row)
+            
+            # Close button
+            buttons.append([Button.inline("❌ Close", "close_list")])
+            
+            if edit:
+                await event.edit(response, buttons=buttons)
+            else:
+                await event.respond(response, buttons=buttons)
+
+        # Store the method in the class for access in callback handler
+        self.send_file_list = send_file_list
+
+        # ... keep existing code (search_handler, delete_handler, rename_handler, message_handler)
 
         @self.client.on(events.NewMessage(pattern=r'/search (.+)'))
         async def search_handler(event):
@@ -536,7 +599,7 @@ class TelegramBot:
 
             # Check if processes are stopped
             if self.should_stop:
-                await event.respond("🛑 **Bot is currently stopped**\n\nPlease wait for an administrator to restart the bot.")
+                await event.respond("🛑 **Bot is currently stopped**\n\nPlease wait for an administrator to restart the bot using /restart command.")
                 return
 
             try:
@@ -580,6 +643,8 @@ class TelegramBot:
         if not text:
             return False
         return text.startswith(('http://', 'https://')) and len(text) > 8
+
+    # ... keep existing code (handle_file_upload, handle_url_upload, download methods, upload methods, format_size)
 
     async def handle_file_upload(self, event):
         """Handle file upload by adding to queue"""
