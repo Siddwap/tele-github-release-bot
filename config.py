@@ -1,7 +1,7 @@
 
 import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List
 
 @dataclass
 class BotConfig:
@@ -11,6 +11,7 @@ class BotConfig:
     github_token: str
     github_repo: str
     github_release_tag: str
+    admin_user_ids: List[int]
     log_level: str = "INFO"
     max_file_size: int = 4 * 1024 * 1024 * 1024  # 4GB
     progress_update_interval: int = 5  # Update every 5%
@@ -18,6 +19,15 @@ class BotConfig:
     @classmethod
     def from_env(cls) -> 'BotConfig':
         """Create config from environment variables"""
+        # Parse admin user IDs from comma-separated string
+        admin_ids_str = os.getenv('ADMIN_USER_IDS', '')
+        admin_user_ids = []
+        if admin_ids_str:
+            try:
+                admin_user_ids = [int(uid.strip()) for uid in admin_ids_str.split(',') if uid.strip()]
+            except ValueError:
+                raise ValueError("ADMIN_USER_IDS must be comma-separated integers")
+        
         return cls(
             telegram_api_id=int(os.getenv('TELEGRAM_API_ID', 0)),
             telegram_api_hash=os.getenv('TELEGRAM_API_HASH', ''),
@@ -25,6 +35,7 @@ class BotConfig:
             github_token=os.getenv('GITHUB_TOKEN', ''),
             github_repo=os.getenv('GITHUB_REPO', ''),
             github_release_tag=os.getenv('GITHUB_RELEASE_TAG', ''),
+            admin_user_ids=admin_user_ids,
             log_level=os.getenv('LOG_LEVEL', 'INFO'),
         )
     
@@ -42,3 +53,10 @@ class BotConfig:
         
         if self.telegram_api_id == 0:
             raise ValueError("Invalid TELEGRAM_API_ID")
+        
+        if not self.admin_user_ids:
+            raise ValueError("At least one admin user ID must be specified in ADMIN_USER_IDS")
+    
+    def is_admin(self, user_id: int) -> bool:
+        """Check if user ID is in admin list"""
+        return user_id in self.admin_user_ids

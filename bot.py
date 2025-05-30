@@ -10,6 +10,7 @@ from telethon import TelegramClient, events
 from telethon.tl.types import DocumentAttributeFilename
 from dotenv import load_dotenv
 from github_uploader import GitHubUploader
+from config import BotConfig
 import time
 
 load_dotenv()
@@ -27,21 +28,35 @@ logger = logging.getLogger(__name__)
 
 class TelegramBot:
     def __init__(self):
-        self.api_id = int(os.getenv('TELEGRAM_API_ID'))
-        self.api_hash = os.getenv('TELEGRAM_API_HASH')
-        self.bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
-        self.github_token = os.getenv('GITHUB_TOKEN')
-        self.github_repo = os.getenv('GITHUB_REPO')
-        self.github_release_tag = os.getenv('GITHUB_RELEASE_TAG')
+        self.config = BotConfig.from_env()
+        self.config.validate()
         
-        if not all([self.api_id, self.api_hash, self.bot_token, self.github_token, self.github_repo, self.github_release_tag]):
-            raise ValueError("Missing required environment variables")
-        
-        self.client = TelegramClient('bot', self.api_id, self.api_hash)
-        self.github_uploader = GitHubUploader(self.github_token, self.github_repo, self.github_release_tag)
+        self.client = TelegramClient('bot', self.config.telegram_api_id, self.config.telegram_api_hash)
+        self.github_uploader = GitHubUploader(self.config.github_token, self.config.github_repo, self.config.github_release_tag)
         self.active_uploads = {}
         self.upload_queues: Dict[int, deque] = {}  # User ID -> queue of uploads
         self.processing_queues: Dict[int, bool] = {}  # User ID -> is processing
+        self.should_stop = False  # Flag to control stopping processes
+
+    def is_admin(self, user_id: int) -> bool:
+        """Check if user is admin"""
+        return self.config.is_admin(user_id)
+
+    async def stop_all_processes(self):
+        """Stop all running processes"""
+        self.should_stop = True
+        # Clear all queues
+        for user_id in list(self.upload_queues.keys()):
+            self.upload_queues[user_id].clear()
+        
+        # Stop processing
+        for user_id in list(self.processing_queues.keys()):
+            self.processing_queues[user_id] = False
+        
+        # Clear active uploads
+        self.active_uploads.clear()
+        
+        logger.info("All processes stopped by admin command")
 
     def sanitize_filename(self, filename: str) -> str:
         """Sanitize filename by replacing special characters while preserving extension"""
@@ -73,6 +88,9 @@ class TelegramBot:
 
     async def add_to_queue(self, user_id: int, upload_item: dict):
         """Add upload item to user's queue"""
+        if self.should_stop:
+            return
+            
         if user_id not in self.upload_queues:
             self.upload_queues[user_id] = deque()
         
@@ -81,8 +99,8 @@ class TelegramBot:
 
     async def process_queue(self, user_id: int):
         """Process upload queue for a user"""
-        if user_id in self.processing_queues and self.processing_queues[user_id]:
-            return  # Already processing
+        if self.should_stop or (user_id in self.processing_queues and self.processing_queues[user_id]):
+            return  # Already processing or stopped
         
         if user_id not in self.upload_queues or not self.upload_queues[user_id]:
             return  # No items in queue
@@ -90,7 +108,7 @@ class TelegramBot:
         self.processing_queues[user_id] = True
         
         try:
-            while self.upload_queues[user_id]:
+            while self.upload_queues[user_id] and not self.should_stop:
                 upload_item = self.upload_queues[user_id].popleft()
                 
                 # Update active uploads
@@ -193,7 +211,7 @@ class TelegramBot:
     async def start(self):
         """Start the bot"""
         try:
-            await self.client.start(bot_token=self.bot_token)
+            await self.client.start(bot_token=self.config.telegram_bot_token)
             logger.info("Bot started successfully")
         except Exception as e:
             logger.error(f"Failed to start bot: {e}")
@@ -201,8 +219,13 @@ class TelegramBot:
         
         @self.client.on(events.NewMessage(pattern='/start'))
         async def start_handler(event):
+            user_id = event.sender_id
+            is_admin = self.is_admin(user_id)
+            admin_status = "**Admin User**" if is_admin else "**Regular User**"
+            
             await event.respond(
-                "🤖 **GitHub Release Uploader Bot**\n\n"
+                f"🤖 **GitHub Release Uploader Bot**\n\n"
+                f"👤 {admin_status}\n\n"
                 "Send me files or URLs to upload to GitHub release!\n\n"
                 "**Features:**\n"
                 "• Send multiple files - they'll upload one by one\n"
@@ -214,41 +237,63 @@ class TelegramBot:
                 "• Send a URL to download and upload\n"
                 "• /help - Show this message\n"
                 "• /status - Check upload status\n"
-                "• /queue - Check queue status\n"
-                "• /list [page] - List files in release (20 per page)\n"
-                "• /search <filename> - Search files by name\n"
-                "• /delete <number> - Delete file by list number\n"
-                "• /rename <number> <new_filename> - Rename file by list number"
+                "• /queue - Check queue status\n" +
+                ("• /list [page] - List files in release (Admin only)\n"
+                "• /search <filename> - Search files by name (Admin only)\n"
+                "• /delete <number> - Delete file by list number (Admin only)\n"
+                "• /rename <number> <new_filename> - Rename file (Admin only)\n"
+                "• /stop - Stop all processes (Admin only)" if is_admin else "")
             )
             raise events.StopPropagation
 
         @self.client.on(events.NewMessage(pattern='/help'))
         async def help_handler(event):
-            await event.respond(
+            user_id = event.sender_id
+            is_admin = self.is_admin(user_id)
+            
+            basic_help = (
                 "**How to use:**\n\n"
                 "1. **File Upload**: Send any file directly to the bot\n"
                 "2. **URL Upload**: Send a URL pointing to a file\n"
                 "3. **Batch Upload**: Send multiple files/URLs - they'll queue automatically\n\n"
-                "**Management:**\n"
-                "• /list [page] - See uploaded files (20 per page)\n"
-                "• /search <filename> - Search files by name\n"
-                "• /delete <number> - Remove file by list number\n"
-                "• /rename <number> <new_filename> - Rename file by list number\n\n"
-                "**Examples:**\n"
-                "• /list - Show first page of files\n"
-                "• /list 2 - Show page 2 of files\n"
-                "• /search video.mp4 - Find files containing 'video.mp4'\n"
-                "• /delete 5 - Delete file number 5 from list\n"
-                "• /rename 5 new_video.mp4 - Rename file number 5\n\n"
                 "**Features:**\n"
                 "• Supports files up to 4GB\n"
                 "• Real-time progress updates with speed\n"
                 "• Queue system for multiple uploads\n"
                 "• Direct upload to GitHub releases\n"
                 "• Returns download URL after upload\n\n"
-                f"**Target Repository:** `{self.github_repo}`\n"
-                f"**Release Tag:** `{self.github_release_tag}`"
+                f"**Target Repository:** `{self.config.github_repo}`\n"
+                f"**Release Tag:** `{self.config.github_release_tag}`"
             )
+            
+            admin_help = (
+                "\n\n**Admin Commands:**\n"
+                "• /list [page] - See uploaded files (20 per page)\n"
+                "• /search <filename> - Search files by name\n"
+                "• /delete <number> - Remove file by list number\n"
+                "• /rename <number> <new_filename> - Rename file by list number\n"
+                "• /stop - Stop all running processes\n\n"
+                "**Examples:**\n"
+                "• /list - Show first page of files\n"
+                "• /list 2 - Show page 2 of files\n"
+                "• /search video.mp4 - Find files containing 'video.mp4'\n"
+                "• /delete 5 - Delete file number 5 from list\n"
+                "• /rename 5 new_video.mp4 - Rename file number 5"
+            )
+            
+            help_text = basic_help + (admin_help if is_admin else "")
+            await event.respond(help_text)
+            raise events.StopPropagation
+
+        @self.client.on(events.NewMessage(pattern='/stop'))
+        async def stop_handler(event):
+            user_id = event.sender_id
+            if not self.is_admin(user_id):
+                await event.respond("❌ **Access Denied**\n\nThis command is only available to administrators.")
+                raise events.StopPropagation
+            
+            await self.stop_all_processes()
+            await event.respond("🛑 **All processes stopped**\n\nAll uploads, queues, and active processes have been halted.")
             raise events.StopPropagation
 
         @self.client.on(events.NewMessage(pattern='/status'))
@@ -281,6 +326,11 @@ class TelegramBot:
 
         @self.client.on(events.NewMessage(pattern=r'/list(?:\s+(\d+))?'))
         async def list_handler(event):
+            user_id = event.sender_id
+            if not self.is_admin(user_id):
+                await event.respond("❌ **Access Denied**\n\nThis command is only available to administrators.")
+                raise events.StopPropagation
+            
             try:
                 # Get page number from command (default to 1)
                 page_match = event.pattern_match.group(1)
@@ -327,6 +377,11 @@ class TelegramBot:
 
         @self.client.on(events.NewMessage(pattern=r'/search (.+)'))
         async def search_handler(event):
+            user_id = event.sender_id
+            if not self.is_admin(user_id):
+                await event.respond("❌ **Access Denied**\n\nThis command is only available to administrators.")
+                raise events.StopPropagation
+            
             try:
                 search_term = event.pattern_match.group(1).strip().lower()
                 if not search_term:
@@ -370,6 +425,11 @@ class TelegramBot:
 
         @self.client.on(events.NewMessage(pattern=r'/delete (\d+)'))
         async def delete_handler(event):
+            user_id = event.sender_id
+            if not self.is_admin(user_id):
+                await event.respond("❌ **Access Denied**\n\nThis command is only available to administrators.")
+                raise events.StopPropagation
+            
             try:
                 file_number = int(event.pattern_match.group(1))
                 if file_number < 1:
@@ -406,6 +466,11 @@ class TelegramBot:
 
         @self.client.on(events.NewMessage(pattern=r'/rename (\d+) (.+)'))
         async def rename_handler(event):
+            user_id = event.sender_id
+            if not self.is_admin(user_id):
+                await event.respond("❌ **Access Denied**\n\nThis command is only available to administrators.")
+                raise events.StopPropagation
+            
             try:
                 file_number = int(event.pattern_match.group(1))
                 new_filename = event.pattern_match.group(2).strip()
@@ -468,6 +533,11 @@ class TelegramBot:
                 return
             
             user_id = event.sender_id
+
+            # Check if processes are stopped
+            if self.should_stop:
+                await event.respond("🛑 **Bot is currently stopped**\n\nPlease wait for an administrator to restart the bot.")
+                return
 
             try:
                 # Handle file uploads
