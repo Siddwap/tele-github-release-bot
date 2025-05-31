@@ -967,9 +967,32 @@ class TelegramBot:
         else:
             await event.respond(response, buttons=buttons)
 
-async def main():
-    bot = TelegramBot()
-    await bot.start()
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    async def handle_url_upload(self, event):
+        """Handle URL upload by adding to queue"""
+        user_id = event.sender_id
+        url = event.message.text.strip()
+        
+        # Generate filename from URL
+        filename = url.split('/')[-1]
+        if '?' in filename:
+            filename = filename.split('?')[0]
+        if not filename or filename == '':
+            filename = f"download_{int(time.time())}.mp4"
+        elif not filename.endswith(('.mp4', '.mkv', '.avi', '.mov', '.flv', '.wmv', '.webm')):
+            filename += '.mp4'
+        
+        sanitized_filename = self.sanitize_filename(filename)
+        
+        # Add to queue
+        upload_item = {
+            'type': 'url',
+            'event': event,
+            'url': url,
+            'filename': sanitized_filename,
+            'user_id': user_id
+        }
+        
+        queue_position = len(self.upload_queues.get(user_id, [])) + 1
+        await event.respond(f"📋 **URL Queued**\n\n🔗 **URL:** `{url[:50]}...`\n📁 **File:** `{sanitized_filename}`\n🔢 **Position:** {queue_position}")
+        
+        await self.add_to_queue(user_id, upload_item)
