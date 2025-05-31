@@ -503,7 +503,7 @@ class TelegramBot:
                 await event.respond(f"❌ **Error searching files**\n\n{str(e)}")
             raise events.StopPropagation
 
-        @self.client.on(events.NewMessage(pattern=r'/delete (\d+)'))
+        @self.client.on(events.NewMessage(pattern=r'/delete (.+)'))
         async def delete_handler(event):
             user_id = event.sender_id
             if not self.is_admin(user_id):
@@ -511,9 +511,11 @@ class TelegramBot:
                 raise events.StopPropagation
             
             try:
-                file_number = int(event.pattern_match.group(1))
-                if file_number < 1:
-                    await event.respond("❌ **Invalid file number**\n\nFile numbers start from 1")
+                delete_args = event.pattern_match.group(1).strip()
+                file_numbers = self.parse_delete_numbers(delete_args)
+                
+                if not file_numbers:
+                    await event.respond("❌ **Invalid format**\n\nExamples:\n• /delete 5\n• /delete 1,3,5\n• /delete 1-5\n• /delete 1-3,7,9-12")
                     return
                 
                 assets = await self.github_uploader.list_release_assets()
@@ -521,27 +523,69 @@ class TelegramBot:
                     await event.respond("📂 **No files found in release**")
                     return
                 
-                if file_number > len(assets):
-                    await event.respond(f"❌ **File number {file_number} not found**\n\nTotal files: {len(assets)}")
+                # Validate all file numbers
+                invalid_numbers = [num for num in file_numbers if num < 1 or num > len(assets)]
+                if invalid_numbers:
+                    await event.respond(f"❌ **Invalid file numbers:** {', '.join(map(str, invalid_numbers))}\n\nValid range: 1-{len(assets)}")
                     return
                 
-                # Get the asset to delete (subtract 1 for 0-based indexing)
-                target_asset = assets[file_number - 1]
-                filename = target_asset['name']
+                # Remove duplicates and sort in descending order (delete from end to avoid index shifting)
+                file_numbers = sorted(set(file_numbers), reverse=True)
                 
-                success = await self.github_uploader.delete_asset_by_name(filename)
-                if success:
-                    await event.respond(
-                        f"✅ **File deleted successfully**\n\n"
-                        f"🗑️ **File #{file_number}:** `{filename}`"
-                    )
+                # Get files to delete
+                files_to_delete = []
+                for num in file_numbers:
+                    asset = assets[num - 1]  # Convert to 0-based index
+                    files_to_delete.append((num, asset['name']))
+                
+                # Confirm deletion
+                if len(files_to_delete) == 1:
+                    confirm_msg = f"🗑️ **Delete 1 file?**\n\n**{files_to_delete[0][0]}.** `{files_to_delete[0][1]}`"
                 else:
-                    await event.respond(f"❌ **Failed to delete file**\n\n📁 **File:** `{filename}`")
-                    
+                    file_list = "\n".join([f"**{num}.** `{name}`" for num, name in files_to_delete[:10]])
+                    if len(files_to_delete) > 10:
+                        file_list += f"\n... and {len(files_to_delete) - 10} more files"
+                    confirm_msg = f"🗑️ **Delete {len(files_to_delete)} files?**\n\n{file_list}"
+                
+                progress_msg = await event.respond(f"{confirm_msg}\n\n⏳ **Starting deletion...**")
+                
+                # Delete files
+                deleted_count = 0
+                failed_files = []
+                
+                for i, (num, filename) in enumerate(files_to_delete, 1):
+                    try:
+                        success = await self.github_uploader.delete_asset_by_name(filename)
+                        if success:
+                            deleted_count += 1
+                        else:
+                            failed_files.append(f"{num}. {filename}")
+                        
+                        # Update progress
+                        await progress_msg.edit(
+                            f"{confirm_msg}\n\n"
+                            f"⏳ **Progress:** {i}/{len(files_to_delete)} files processed\n"
+                            f"✅ **Deleted:** {deleted_count} files"
+                        )
+                        
+                    except Exception as e:
+                        failed_files.append(f"{num}. {filename} (Error: {str(e)})")
+                
+                # Final result
+                result_msg = f"✅ **Deletion Complete**\n\n📊 **Successfully deleted:** {deleted_count}/{len(files_to_delete)} files"
+                
+                if failed_files:
+                    failed_list = "\n".join(failed_files[:5])
+                    if len(failed_files) > 5:
+                        failed_list += f"\n... and {len(failed_files) - 5} more"
+                    result_msg += f"\n\n❌ **Failed to delete:**\n{failed_list}"
+                
+                await progress_msg.edit(result_msg)
+                
             except ValueError:
-                await event.respond("❌ **Invalid file number**\n\nPlease provide a valid number")
+                await event.respond("❌ **Invalid format**\n\nExamples:\n• /delete 5\n• /delete 1,3,5\n• /delete 1-5\n• /delete 1-3,7,9-12")
             except Exception as e:
-                await event.respond(f"❌ **Error deleting file**\n\n{str(e)}")
+                await event.respond(f"❌ **Error deleting files**\n\n{str(e)}")
             raise events.StopPropagation
 
         @self.client.on(events.NewMessage(pattern=r'/rename (\d+) (.+)'))
@@ -589,7 +633,7 @@ class TelegramBot:
                 
                 progress_msg = await event.respond(f"🔄 **Renaming file...**\n\n📁 **From:** `{old_filename}`\n📁 **To:** `{sanitized_filename}`")
                 
-                success = await self.github_uploader.rename_asset(old_filename, sanitized_filename)
+                success = await self.github_uploader.rename_asset_fast(old_filename, sanitized_filename)
                 if success:
                     await progress_msg.edit(
                         f"✅ **File renamed successfully**\n\n"
@@ -899,6 +943,36 @@ class TelegramBot:
                 return f"{size:.1f} {unit}"
             size /= 1024.0
         return f"{size:.1f} TB"
+
+    def parse_delete_numbers(self, delete_args: str) -> List[int]:
+        """Parse delete command arguments to extract file numbers"""
+        numbers = []
+        
+        # Split by comma to handle multiple arguments
+        parts = [part.strip() for part in delete_args.split(',')]
+        
+        for part in parts:
+            if '-' in part and part.count('-') == 1:
+                # Handle range (e.g., "1-5")
+                try:
+                    start, end = part.split('-')
+                    start_num = int(start.strip())
+                    end_num = int(end.strip())
+                    
+                    if start_num > end_num:
+                        continue  # Invalid range
+                    
+                    numbers.extend(range(start_num, end_num + 1))
+                except ValueError:
+                    continue  # Invalid range format
+            else:
+                # Handle single number
+                try:
+                    numbers.append(int(part))
+                except ValueError:
+                    continue  # Invalid number
+        
+        return numbers
 
 async def main():
     bot = TelegramBot()
