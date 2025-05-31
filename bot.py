@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 import os
@@ -119,6 +118,38 @@ class TelegramBot:
         else:
             return name_part
 
+    async def parse_batch_file(self, file_content: str) -> List[Dict]:
+        """Parse batch file content to extract video names and URLs"""
+        batch_items = []
+        lines = file_content.strip().split('\n')
+        
+        for line_num, line in enumerate(lines, 1):
+            line = line.strip()
+            if not line or line.startswith('#'):  # Skip empty lines and comments
+                continue
+            
+            # Parse format: video_name : url
+            if ':' in line:
+                parts = line.split(':', 1)
+                if len(parts) == 2:
+                    video_name = parts[0].strip()
+                    url = parts[1].strip()
+                    
+                    if self.is_url(url) and video_name:
+                        # Sanitize filename
+                        if not video_name.endswith(('.mp4', '.mkv', '.avi', '.mov')):
+                            video_name += '.mp4'
+                        
+                        sanitized_name = self.sanitize_filename(video_name)
+                        
+                        batch_items.append({
+                            'name': sanitized_name,
+                            'url': url,
+                            'line': line_num
+                        })
+            
+        return batch_items
+
     async def add_to_queue(self, user_id: int, upload_item: dict):
         """Add upload item to user's queue"""
         if self.should_stop:
@@ -156,6 +187,8 @@ class TelegramBot:
                     await self.process_url_upload(upload_item)
                 elif upload_item['type'] == 'm3u8':
                     await self.process_m3u8_upload(upload_item)
+                elif upload_item['type'] == 'batch':
+                    await self.process_batch_upload(upload_item)
                 
         except Exception as e:
             logger.error(f"Error processing queue for user {user_id}: {e}")
@@ -298,6 +331,70 @@ class TelegramBot:
                 except:
                     pass
 
+    async def process_batch_upload(self, upload_item: dict):
+        """Process a single batch upload item"""
+        event = upload_item['event']
+        batch_items = upload_item['batch_items']
+        user_id = upload_item['user_id']
+        
+        progress_msg = await event.respond(f"📋 **Processing Batch Upload...**\n\n⏳ Found {len(batch_items)} items to process")
+        
+        try:
+            successful = 0
+            failed = 0
+            
+            for i, item in enumerate(batch_items, 1):
+                try:
+                    await progress_msg.edit(
+                        f"📋 **Processing Batch Upload...**\n\n"
+                        f"📁 Processing: `{item['name']}`\n"
+                        f"⏳ Progress: {i}/{len(batch_items)}\n"
+                        f"✅ Successful: {successful}\n"
+                        f"❌ Failed: {failed}"
+                    )
+                    
+                    # Check if it's an M3U8 URL
+                    if await self.m3u8_handler.is_m3u8_url(item['url']):
+                        # Add M3U8 item to queue
+                        m3u8_item = {
+                            'type': 'm3u8',
+                            'event': event,
+                            'url': item['url'],
+                            'filename': item['name'],
+                            'user_id': user_id,
+                            'quality': None  # Will use default/highest quality
+                        }
+                        await self.add_to_queue(user_id, m3u8_item)
+                    else:
+                        # Add regular URL item to queue
+                        url_item = {
+                            'type': 'url',
+                            'event': event,
+                            'url': item['url'],
+                            'filename': item['name'],
+                            'user_id': user_id
+                        }
+                        await self.add_to_queue(user_id, url_item)
+                    
+                    successful += 1
+                    
+                except Exception as e:
+                    logger.error(f"Error processing batch item {item['name']}: {e}")
+                    failed += 1
+            
+            remaining = len(self.upload_queues.get(user_id, []))
+            await progress_msg.edit(
+                f"✅ **Batch Upload Queued!**\n\n"
+                f"📊 **Total items:** {len(batch_items)}\n"
+                f"✅ **Successfully queued:** {successful}\n"
+                f"❌ **Failed:** {failed}\n"
+                f"📋 **Items in queue:** {remaining}"
+            )
+            
+        except Exception as e:
+            logger.error(f"Error processing batch upload: {e}")
+            await progress_msg.edit(f"❌ **Batch Upload Failed**\n\nError: {str(e)}")
+
     async def start(self):
         """Start the bot"""
         try:
@@ -307,8 +404,6 @@ class TelegramBot:
             logger.error(f"Failed to start bot: {e}")
             raise
         
-        # ... keep existing code (start_handler, help_handler, stop_handler, restart_handler, status_handler, queue_handler, list_handler)
-
         @self.client.on(events.NewMessage(pattern='/start'))
         async def start_handler(event):
             user_id = event.sender_id
@@ -323,25 +418,25 @@ class TelegramBot:
                 "• Send multiple files - they'll upload one by one\n"
                 "• Send multiple URLs - processed in order\n"
                 "• M3U8 video support with quality selection\n"
+                "• Batch upload from text files (format: `name : url`)\n"
                 "• Real-time progress with speed display\n"
                 "• Queue system for batch uploads\n\n"
                 "**Commands:**\n"
                 "• Send any file (up to 4GB)\n"
                 "• Send a URL to download and upload\n"
                 "• Send M3U8 video links (with quality options)\n"
+                "• Send .txt file for batch upload\n"
                 "• /help - Show this message\n"
                 "• /status - Check upload status\n"
                 "• /queue - Check queue status\n" +
                 ("• /list - List files in release with navigation (Admin only)\n"
                 "• /search <filename> - Search files by name (Admin only)\n"
-                "• /delete <number> - Delete file by list number (Admin only)\n"
+                "• /delete <numbers/ranges> - Delete files (Admin only)\n"
                 "• /rename <number> <new_filename> - Rename file (Admin only)\n"
                 "• /stop - Stop all processes (Admin only)\n"
                 "• /restart - Restart all processes (Admin only)" if is_admin else "")
             )
             raise events.StopPropagation
-
-        # ... keep existing code (other handlers)
 
         @self.client.on(events.CallbackQuery)
         async def callback_handler(event):
@@ -404,8 +499,6 @@ class TelegramBot:
                 await event.delete()
                 await event.answer()
 
-        # ... keep existing code (remaining handlers)
-
         @self.client.on(events.NewMessage)
         async def message_handler(event):
             # Skip if it's a command (already handled by specific handlers)
@@ -429,7 +522,7 @@ class TelegramBot:
                 if event.message.text:
                     text = event.message.text.strip()
                     if self.is_url(text):
-                        # Check if it's an M3U8 URL
+                        # Check if it's an M3U8 URL (improved detection)
                         if await self.m3u8_handler.is_m3u8_url(text):
                             await self.handle_m3u8_upload(event)
                         else:
@@ -443,7 +536,8 @@ class TelegramBot:
                             "Please send:\n"
                             "• A file (drag & drop or attach)\n"
                             "• A direct download URL\n"
-                            "• An M3U8 video link\n\n"
+                            "• An M3U8 video link\n"
+                            "• A .txt file for batch upload (format: `name : url`)\n\n"
                             "Use /help for more information."
                         )
                 
@@ -529,8 +623,6 @@ class TelegramBot:
             logger.error(f"Error handling M3U8 upload: {e}")
             await event.respond(f"❌ **M3U8 Error**\n\nFailed to process M3U8 video: {str(e)}")
 
-    # ... keep existing code (remaining methods)
-
     async def handle_file_upload(self, event):
         """Handle file upload by adding to queue"""
         user_id = event.sender_id
@@ -542,6 +634,11 @@ class TelegramBot:
             if isinstance(attr, DocumentAttributeFilename):
                 filename = attr.file_name
                 break
+        
+        # Check if it's a batch upload text file
+        if filename.lower().endswith('.txt'):
+            await self.handle_batch_upload(event)
+            return
         
         # Sanitize filename to avoid GitHub upload issues
         sanitized_filename = self.sanitize_filename(filename)
@@ -571,38 +668,46 @@ class TelegramBot:
         
         await self.add_to_queue(user_id, upload_item)
 
-    async def handle_url_upload(self, event):
-        """Handle URL upload by adding to queue"""
+    async def handle_batch_upload(self, event):
+        """Handle batch upload from text file"""
         user_id = event.sender_id
-        url = event.message.text.strip()
+        document = event.message.document
         
-        # Extract filename from URL
-        filename = url.split('/')[-1] or f"download_{int(time.time())}"
-        if '?' in filename:
-            filename = filename.split('?')[0]
-        
-        # Sanitize filename to avoid GitHub upload issues
-        sanitized_filename = self.sanitize_filename(filename)
-        if sanitized_filename != filename:
-            logger.info(f"Sanitized filename: '{filename}' -> '{sanitized_filename}'")
-        
-        logger.info(f"Queuing URL: {url}")
-        
-        # Add to queue
-        upload_item = {
-            'type': 'url',
-            'event': event,
-            'url': url,
-            'filename': sanitized_filename,
-            'user_id': user_id
-        }
-        
-        queue_position = len(self.upload_queues.get(user_id, [])) + 1
-        await event.respond(f"📋 **URL Queued**\n\n🔗 **URL:** `{url}`\n📁 **File:** `{sanitized_filename}`\n🔢 **Position:** {queue_position}")
-        
-        await self.add_to_queue(user_id, upload_item)
-
-    # ... keep existing code (remaining methods - download_telegram_file_streaming, download_from_url_streaming, upload_to_github_streaming, format_size, parse_delete_numbers, send_file_list)
+        try:
+            progress_msg = await event.respond("📋 **Processing batch file...**\n⏳ Reading file content...")
+            
+            # Download the text file
+            with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.txt') as temp_file:
+                await self.client.download_media(document, file=temp_file.name)
+                
+                # Read file content
+                with open(temp_file.name, 'r', encoding='utf-8') as f:
+                    file_content = f.read()
+                
+                # Clean up temp file
+                os.unlink(temp_file.name)
+            
+            # Parse batch items
+            batch_items = await self.parse_batch_file(file_content)
+            
+            if not batch_items:
+                await progress_msg.edit("❌ **No valid items found**\n\nPlease check your file format:\n`video_name : url`")
+                return
+            
+            # Add batch processing to queue
+            upload_item = {
+                'type': 'batch',
+                'event': event,
+                'batch_items': batch_items,
+                'user_id': user_id
+            }
+            
+            await progress_msg.edit(f"✅ **Batch file processed**\n\n📊 **Found:** {len(batch_items)} valid items\n⏳ **Adding to queue...**")
+            await self.process_batch_upload(upload_item)
+            
+        except Exception as e:
+            logger.error(f"Error handling batch upload: {e}")
+            await event.respond(f"❌ **Batch Upload Error**\n\nFailed to process batch file: {str(e)}")
 
     async def download_telegram_file_streaming(self, document, temp_file, progress_msg, filename: str):
         """Download file from Telegram with progress and speed using streaming to temp file - OPTIMIZED"""
@@ -836,7 +941,7 @@ class TelegramBot:
         
         # Add total info
         response += f"📄 **Total:** {len(assets)} files | **Page:** {page}/{total_pages}\n"
-        response += f"🗑️ Use `/delete <number>` to delete a file\n"
+        response += f"🗑️ Use `/delete <numbers/ranges>` to delete files\n"
         response += f"✏️ Use `/rename <number> <new_name>` to rename a file"
         
         # Create navigation buttons

@@ -18,22 +18,52 @@ class M3U8Handler:
             'Accept-Language': 'en-US,en;q=0.9',
             'Accept-Encoding': 'gzip, deflate, br',
             'Connection': 'keep-alive',
+            'Referer': 'https://www.google.com/',
         }
     
     async def is_m3u8_url(self, url: str) -> bool:
-        """Check if URL is an M3U8 playlist"""
+        """Check if URL is an M3U8 playlist by downloading and checking content"""
         try:
-            # Check file extension
+            # First check file extension
             if url.lower().endswith('.m3u8'):
                 return True
             
-            # Check content type
-            timeout = aiohttp.ClientTimeout(total=10)
+            # Check content type and actual content
+            timeout = aiohttp.ClientTimeout(total=15)
             async with aiohttp.ClientSession(timeout=timeout, headers=self.session_headers) as session:
-                async with session.head(url) as response:
-                    content_type = response.headers.get('content-type', '').lower()
-                    return 'mpegurl' in content_type or 'vnd.apple.mpegurl' in content_type
-        except:
+                # Try HEAD request first
+                try:
+                    async with session.head(url) as response:
+                        content_type = response.headers.get('content-type', '').lower()
+                        if 'mpegurl' in content_type or 'vnd.apple.mpegurl' in content_type:
+                            return True
+                except:
+                    pass
+                
+                # If HEAD fails or doesn't show M3U8, try GET request with limited download
+                try:
+                    async with session.get(url) as response:
+                        if response.status == 200:
+                            # Read first 2KB to check if it's M3U8 content
+                            chunk = await response.content.read(2048)
+                            content = chunk.decode('utf-8', errors='ignore')
+                            
+                            # Check for M3U8 signatures
+                            m3u8_signatures = [
+                                '#EXTM3U',
+                                '#EXT-X-VERSION',
+                                '#EXT-X-STREAM-INF',
+                                '#EXT-X-TARGETDURATION',
+                                '#EXTINF'
+                            ]
+                            
+                            return any(sig in content for sig in m3u8_signatures)
+                except:
+                    pass
+            
+            return False
+        except Exception as e:
+            logger.debug(f"Error checking M3U8 URL: {e}")
             return False
     
     async def download_m3u8_content(self, url: str) -> str:
@@ -99,17 +129,36 @@ class M3U8Handler:
         
         return segments
     
+    async def download_segment(self, session: aiohttp.ClientSession, segment_url: str, semaphore: asyncio.Semaphore) -> bytes:
+        """Download a single segment with semaphore control"""
+        async with semaphore:
+            try:
+                async with session.get(segment_url) as response:
+                    if response.status == 200:
+                        return await response.read()
+                    else:
+                        logger.warning(f"Failed to download segment: HTTP {response.status}")
+                        return b''
+            except Exception as e:
+                logger.error(f"Error downloading segment: {e}")
+                return b''
+    
     async def download_video_segments(self, segments: List[str], output_file: str, progress_callback=None) -> int:
-        """Download all video segments and combine them into a single file"""
+        """Download all video segments with concurrent downloads and combine them"""
         total_segments = len(segments)
         total_downloaded = 0
         
+        # Limit concurrent downloads to avoid overwhelming the server
+        max_concurrent = min(10, total_segments)
+        semaphore = asyncio.Semaphore(max_concurrent)
+        
         timeout = aiohttp.ClientTimeout(total=None, connect=30)
         connector = aiohttp.TCPConnector(
-            limit=100,
-            limit_per_host=10,
+            limit=200,
+            limit_per_host=50,
             ttl_dns_cache=300,
-            use_dns_cache=True
+            use_dns_cache=True,
+            enable_cleanup_closed=True
         )
         
         async with aiohttp.ClientSession(
@@ -119,26 +168,30 @@ class M3U8Handler:
         ) as session:
             
             with open(output_file, 'wb') as f:
-                for i, segment_url in enumerate(segments):
-                    try:
-                        async with session.get(segment_url) as response:
-                            if response.status == 200:
-                                chunk_size = 1024 * 1024  # 1MB chunks
-                                async for chunk in response.content.iter_chunked(chunk_size):
-                                    f.write(chunk)
-                                    total_downloaded += len(chunk)
-                                
-                                # Update progress
-                                if progress_callback:
-                                    progress = ((i + 1) / total_segments) * 100
-                                    await progress_callback(progress, i + 1, total_segments, total_downloaded)
-                            else:
-                                logger.warning(f"Failed to download segment {i + 1}: HTTP {response.status}")
+                # Process segments in batches to maintain order while allowing concurrency
+                batch_size = 20
+                for batch_start in range(0, total_segments, batch_size):
+                    batch_end = min(batch_start + batch_size, total_segments)
+                    batch_segments = segments[batch_start:batch_end]
                     
-                    except Exception as e:
-                        logger.error(f"Error downloading segment {i + 1}: {e}")
-                        # Continue with next segment instead of failing completely
-                        continue
+                    # Download batch concurrently
+                    tasks = [
+                        self.download_segment(session, segment_url, semaphore)
+                        for segment_url in batch_segments
+                    ]
+                    
+                    batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+                    
+                    # Write segments in order
+                    for i, segment_data in enumerate(batch_results):
+                        if isinstance(segment_data, bytes) and segment_data:
+                            f.write(segment_data)
+                            total_downloaded += len(segment_data)
+                        
+                        # Update progress
+                        if progress_callback:
+                            progress = ((batch_start + i + 1) / total_segments) * 100
+                            await progress_callback(progress, batch_start + i + 1, total_segments, total_downloaded)
         
         return total_downloaded
     
@@ -216,7 +269,7 @@ class M3U8Handler:
             # Parse segments
             segments = self.parse_m3u8_segments(playlist_content, playlist_base_url)
             
-            # Download all segments
+            # Download all segments with optimized concurrent downloading
             total_size = await self.download_video_segments(segments, output_file, progress_callback)
             
             return total_size
