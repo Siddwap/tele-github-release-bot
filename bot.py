@@ -438,6 +438,283 @@ class TelegramBot:
             )
             raise events.StopPropagation
 
+        @self.client.on(events.NewMessage(pattern='/help'))
+        async def help_handler(event):
+            user_id = event.sender_id
+            is_admin = self.is_admin(user_id)
+            admin_status = "**Admin User**" if is_admin else "**Regular User**"
+            
+            await event.respond(
+                f"🤖 **GitHub Release Uploader Bot - Help**\n\n"
+                f"👤 {admin_status}\n\n"
+                "**Features:**\n"
+                "• Send multiple files - they'll upload one by one\n"
+                "• Send multiple URLs - processed in order\n"
+                "• M3U8 video support with quality selection\n"
+                "• Batch upload from text files (format: `name : url`)\n"
+                "• Real-time progress with speed display\n"
+                "• Queue system for batch uploads\n\n"
+                "**Commands:**\n"
+                "• Send any file (up to 4GB)\n"
+                "• Send a URL to download and upload\n"
+                "• Send M3U8 video links (with quality options)\n"
+                "• Send .txt file for batch upload\n"
+                "• /help - Show this message\n"
+                "• /status - Check upload status\n"
+                "• /queue - Check queue status\n" +
+                ("• /list - List files in release with navigation (Admin only)\n"
+                "• /search <filename> - Search files by name (Admin only)\n"
+                "• /delete <numbers/ranges> - Delete files (Admin only)\n"
+                "• /rename <number> <new_filename> - Rename file (Admin only)\n"
+                "• /stop - Stop all processes (Admin only)\n"
+                "• /restart - Restart all processes (Admin only)" if is_admin else "")
+            )
+            raise events.StopPropagation
+
+        @self.client.on(events.NewMessage(pattern='/status'))
+        async def status_handler(event):
+            user_id = event.sender_id
+            
+            # Get current upload status
+            current_upload = self.active_uploads.get(user_id)
+            queue_size = len(self.upload_queues.get(user_id, []))
+            is_processing = self.processing_queues.get(user_id, False)
+            
+            status_text = "📊 **Upload Status**\n\n"
+            
+            if current_upload:
+                status_text += f"🔄 **Current Upload:**\n"
+                status_text += f"📁 File: `{current_upload['filename']}`\n"
+                status_text += f"📈 Status: {current_upload['status']}\n\n"
+            
+            if queue_size > 0:
+                status_text += f"📋 **Queue:** {queue_size} files waiting\n"
+            else:
+                status_text += f"📋 **Queue:** Empty\n"
+            
+            if is_processing:
+                status_text += f"⚙️ **Processing:** Active\n"
+            else:
+                status_text += f"⚙️ **Processing:** Idle\n"
+            
+            if self.should_stop:
+                status_text += f"🛑 **Bot Status:** Stopped by admin\n"
+            else:
+                status_text += f"✅ **Bot Status:** Running\n"
+            
+            await event.respond(status_text)
+            raise events.StopPropagation
+
+        @self.client.on(events.NewMessage(pattern='/queue'))
+        async def queue_handler(event):
+            user_id = event.sender_id
+            
+            queue = self.upload_queues.get(user_id, deque())
+            
+            if not queue:
+                await event.respond("📋 **Queue Status**\n\n✅ Your queue is empty")
+                raise events.StopPropagation
+            
+            queue_text = f"📋 **Queue Status**\n\n📊 **Total items:** {len(queue)}\n\n"
+            
+            for i, item in enumerate(list(queue)[:10], 1):  # Show first 10 items
+                queue_text += f"**{i}.** `{item.get('filename', 'Unknown')}`\n"
+                queue_text += f"   📂 Type: {item.get('type', 'Unknown').upper()}\n\n"
+            
+            if len(queue) > 10:
+                queue_text += f"... and {len(queue) - 10} more items\n"
+            
+            await event.respond(queue_text)
+            raise events.StopPropagation
+
+        @self.client.on(events.NewMessage(pattern='/list'))
+        async def list_handler(event):
+            user_id = event.sender_id
+            
+            if not self.is_admin(user_id):
+                await event.respond("❌ **Access Denied**\n\nThis command is only available to administrators.")
+                raise events.StopPropagation
+            
+            await self.send_file_list(event, page=1)
+            raise events.StopPropagation
+
+        @self.client.on(events.NewMessage(pattern=r'/search (.+)'))
+        async def search_handler(event):
+            user_id = event.sender_id
+            
+            if not self.is_admin(user_id):
+                await event.respond("❌ **Access Denied**\n\nThis command is only available to administrators.")
+                raise events.StopPropagation
+            
+            search_term = event.pattern_match.group(1).strip()
+            
+            try:
+                assets = await self.github_uploader.list_release_assets()
+                matching_assets = [asset for asset in assets if search_term.lower() in asset['name'].lower()]
+                
+                if not matching_assets:
+                    await event.respond(f"🔍 **Search Results**\n\nNo files found matching: `{search_term}`")
+                    raise events.StopPropagation
+                
+                response = f"🔍 **Search Results for:** `{search_term}`\n\n"
+                response += f"📊 **Found:** {len(matching_assets)} files\n\n"
+                
+                for i, asset in enumerate(matching_assets[:20], 1):  # Show first 20 results
+                    size_mb = asset['size'] / (1024 * 1024)
+                    response += f"**{i}.** `{asset['name']}`\n"
+                    response += f"   📊 Size: {size_mb:.1f} MB\n"
+                    response += f"   🔗 [Download]({asset['browser_download_url']})\n\n"
+                
+                if len(matching_assets) > 20:
+                    response += f"... and {len(matching_assets) - 20} more results\n"
+                
+                await event.respond(response)
+                
+            except Exception as e:
+                logger.error(f"Error searching files: {e}")
+                await event.respond(f"❌ **Search Error**\n\nFailed to search files: {str(e)}")
+            
+            raise events.StopPropagation
+
+        @self.client.on(events.NewMessage(pattern=r'/delete (.+)'))
+        async def delete_handler(event):
+            user_id = event.sender_id
+            
+            if not self.is_admin(user_id):
+                await event.respond("❌ **Access Denied**\n\nThis command is only available to administrators.")
+                raise events.StopPropagation
+            
+            delete_args = event.pattern_match.group(1).strip()
+            
+            try:
+                # Parse numbers and ranges
+                numbers = self.parse_delete_numbers(delete_args)
+                
+                if not numbers:
+                    await event.respond("❌ **Invalid Format**\n\nUse: `/delete 1,2,3` or `/delete 1-5` or `/delete 1,3-7,10`")
+                    raise events.StopPropagation
+                
+                # Get assets list
+                assets = await self.github_uploader.list_release_assets()
+                
+                if not assets:
+                    await event.respond("📂 **No files found in release**")
+                    raise events.StopPropagation
+                
+                # Validate numbers
+                invalid_numbers = [num for num in numbers if num < 1 or num > len(assets)]
+                if invalid_numbers:
+                    await event.respond(f"❌ **Invalid file numbers:** {', '.join(map(str, invalid_numbers))}\n\nValid range: 1-{len(assets)}")
+                    raise events.StopPropagation
+                
+                # Get files to delete
+                files_to_delete = [assets[num - 1] for num in sorted(set(numbers))]
+                
+                progress_msg = await event.respond(f"🗑️ **Deleting {len(files_to_delete)} files...**\n⏳ Starting...")
+                
+                deleted_count = 0
+                failed_count = 0
+                
+                for i, asset in enumerate(files_to_delete, 1):
+                    try:
+                        await progress_msg.edit(
+                            f"🗑️ **Deleting files...**\n\n"
+                            f"📁 Deleting: `{asset['name']}`\n"
+                            f"⏳ Progress: {i}/{len(files_to_delete)}\n"
+                            f"✅ Deleted: {deleted_count}\n"
+                            f"❌ Failed: {failed_count}"
+                        )
+                        
+                        await self.github_uploader.delete_release_asset(asset['id'])
+                        deleted_count += 1
+                        
+                    except Exception as e:
+                        logger.error(f"Error deleting asset {asset['name']}: {e}")
+                        failed_count += 1
+                
+                await progress_msg.edit(
+                    f"✅ **Deletion Complete!**\n\n"
+                    f"📊 **Total files:** {len(files_to_delete)}\n"
+                    f"✅ **Successfully deleted:** {deleted_count}\n"
+                    f"❌ **Failed:** {failed_count}"
+                )
+                
+            except Exception as e:
+                logger.error(f"Error in delete command: {e}")
+                await event.respond(f"❌ **Delete Error**\n\nFailed to delete files: {str(e)}")
+            
+            raise events.StopPropagation
+
+        @self.client.on(events.NewMessage(pattern=r'/rename (\d+) (.+)'))
+        async def rename_handler(event):
+            user_id = event.sender_id
+            
+            if not self.is_admin(user_id):
+                await event.respond("❌ **Access Denied**\n\nThis command is only available to administrators.")
+                raise events.StopPropagation
+            
+            file_number = int(event.pattern_match.group(1))
+            new_filename = event.pattern_match.group(2).strip()
+            
+            try:
+                # Get assets list
+                assets = await self.github_uploader.list_release_assets()
+                
+                if not assets:
+                    await event.respond("📂 **No files found in release**")
+                    raise events.StopPropagation
+                
+                if file_number < 1 or file_number > len(assets):
+                    await event.respond(f"❌ **Invalid file number:** {file_number}\n\nValid range: 1-{len(assets)}")
+                    raise events.StopPropagation
+                
+                asset = assets[file_number - 1]
+                old_filename = asset['name']
+                
+                # Sanitize new filename
+                sanitized_filename = self.sanitize_filename(new_filename)
+                
+                progress_msg = await event.respond(f"✏️ **Renaming file...**\n\n📁 From: `{old_filename}`\n📁 To: `{sanitized_filename}`\n⏳ Processing...")
+                
+                # Rename the asset
+                await self.github_uploader.rename_release_asset(asset['id'], sanitized_filename)
+                
+                await progress_msg.edit(
+                    f"✅ **File Renamed Successfully!**\n\n"
+                    f"📁 **Old name:** `{old_filename}`\n"
+                    f"📁 **New name:** `{sanitized_filename}`"
+                )
+                
+            except Exception as e:
+                logger.error(f"Error renaming file: {e}")
+                await event.respond(f"❌ **Rename Error**\n\nFailed to rename file: {str(e)}")
+            
+            raise events.StopPropagation
+
+        @self.client.on(events.NewMessage(pattern='/stop'))
+        async def stop_handler(event):
+            user_id = event.sender_id
+            
+            if not self.is_admin(user_id):
+                await event.respond("❌ **Access Denied**\n\nThis command is only available to administrators.")
+                raise events.StopPropagation
+            
+            await self.stop_all_processes()
+            await event.respond("🛑 **All processes stopped**\n\nBot will reject new uploads until restarted with /restart command.")
+            raise events.StopPropagation
+
+        @self.client.on(events.NewMessage(pattern='/restart'))
+        async def restart_handler(event):
+            user_id = event.sender_id
+            
+            if not self.is_admin(user_id):
+                await event.respond("❌ **Access Denied**\n\nThis command is only available to administrators.")
+                raise events.StopPropagation
+            
+            await self.restart_all_processes()
+            await event.respond("✅ **All processes restarted**\n\nBot is now accepting new uploads.")
+            raise events.StopPropagation
+
         @self.client.on(events.CallbackQuery)
         async def callback_handler(event):
             user_id = event.sender_id
