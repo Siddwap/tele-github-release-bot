@@ -3,7 +3,6 @@
 """
 Simple runner script for the Telegram bot and Flask app.
 """
-import asyncio
 import sys
 import logging
 import signal
@@ -44,7 +43,7 @@ def signal_handler(signum, frame):
     logger.info("Received shutdown signal, stopping bot...")
     sys.exit(0)
 
-async def main():
+def main():
     """Main entry point"""
     setup_logging()
     logger = logging.getLogger(__name__)
@@ -82,4 +81,4 @@ async def main():
         sys.exit(1)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
