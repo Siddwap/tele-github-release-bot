@@ -63,9 +63,14 @@ async def main():
         logger.info(f"Target repository: {config.github_repo}")
         logger.info(f"Release tag: {config.github_release_tag}")
         
-        # Start the bot
-        bot = TelegramBot()
-        await bot.start()
+        # Start the bot with proper parameters
+        bot = TelegramBot(
+            telegram_token=config.telegram_bot_token,
+            github_token=config.github_token,
+            github_repo=config.github_repo,
+            github_release_tag=config.github_release_tag
+        )
+        bot.run()
         
     except ValueError as e:
         logger.error(f"Configuration error: {e}")
