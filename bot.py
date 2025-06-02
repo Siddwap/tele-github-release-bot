@@ -44,6 +44,7 @@ class TelegramBot:
         self.should_stop = False  # Flag to control stopping processes
         self.active_sessions: Dict[int, List] = {}  # User ID -> list of active aiohttp sessions
         self.flood_wait_delay = 1  # Initial delay between operations to avoid flood wait
+        self.pending_txt_uploads: Dict[int, Dict] = {}  # User ID -> pending TXT upload data
 
     def is_admin(self, user_id: int) -> bool:
         """Check if user is admin"""
@@ -70,6 +71,9 @@ class TelegramBot:
         
         # Clear active uploads
         self.active_uploads.clear()
+        
+        # Clear pending TXT uploads
+        self.pending_txt_uploads.clear()
         
         logger.info("All processes stopped by admin command")
 
@@ -127,7 +131,7 @@ class TelegramBot:
         videos = []
         lines = content.strip().split('\n')
         
-        for line in lines:
+        for i, line in enumerate(lines, 1):
             line = line.strip()
             if not line or line.startswith('#'):
                 continue
@@ -145,12 +149,12 @@ class TelegramBot:
                         if not name.lower().endswith('.mp4'):
                             name += '.mp4'
                         sanitized_name = self.sanitize_filename(name)
-                        videos.append({'name': sanitized_name, 'url': url})
+                        videos.append({'name': sanitized_name, 'url': url, 'line_number': i})
             else:
                 # Treat the whole line as URL and generate filename
                 if line.startswith(('http://', 'https://')):
                     filename = f"video_{len(videos) + 1}.mp4"
-                    videos.append({'name': filename, 'url': line})
+                    videos.append({'name': filename, 'url': line, 'line_number': i})
         
         return videos
 
@@ -419,7 +423,7 @@ class TelegramBot:
                     pass
 
     async def process_txt_m3u8_upload(self, upload_item: dict):
-        """Process TXT file containing M3U8 URLs"""
+        """Process TXT file containing M3U8 URLs with start position option"""
         event = upload_item['event']
         document = upload_item['document']
         user_id = upload_item['user_id']
@@ -437,10 +441,82 @@ class TelegramBot:
             await self.safe_edit_message(progress_msg, "❌ **No valid URLs found in TXT file**\n\nExpected format: video_name : https://example.com/video.m3u8")
             return
         
-        await self.safe_edit_message(progress_msg, f"📋 **Found {len(videos)} videos in TXT file**\n\n⏳ Adding to queue...")
+        # Store parsed videos for this user
+        self.pending_txt_uploads[user_id] = {
+            'videos': videos,
+            'event': event,
+            'progress_msg': progress_msg
+        }
         
-        # Add each video to queue
-        for i, video in enumerate(videos):
+        # Create video list for user to see
+        video_list = ""
+        for i, video in enumerate(videos[:10], 1):  # Show first 10 videos
+            video_list += f"**{i}.** `{video['name']}`\n"
+        
+        if len(videos) > 10:
+            video_list += f"... and {len(videos) - 10} more videos"
+        
+        # Create buttons for start position
+        buttons = []
+        
+        # Create number buttons (1-10 or total videos if less than 10)
+        button_row = []
+        max_buttons = min(len(videos), 10)
+        
+        for i in range(1, max_buttons + 1):
+            button_row.append(Button.inline(str(i), f"start_{i}"))
+            if len(button_row) == 5:  # 5 buttons per row
+                buttons.append(button_row)
+                button_row = []
+        
+        if button_row:  # Add remaining buttons
+            buttons.append(button_row)
+        
+        # Add "All" and "Custom" buttons
+        action_buttons = [
+            Button.inline("📥 All", "start_all"),
+            Button.inline("✏️ Custom", "start_custom")
+        ]
+        buttons.append(action_buttons)
+        
+        # Add cancel button
+        buttons.append([Button.inline("❌ Cancel", "start_cancel")])
+        
+        await self.safe_edit_message(progress_msg,
+            f"📋 **Found {len(videos)} videos in TXT file**\n\n"
+            f"📝 **Video List:**\n{video_list}\n\n"
+            f"🎯 **Where to start uploading?**\n"
+            f"Choose a number to start from that position:",
+            buttons=buttons
+        )
+
+    async def process_txt_start_selection(self, user_id: int, start_position: int):
+        """Process TXT upload starting from specified position"""
+        if user_id not in self.pending_txt_uploads:
+            return
+        
+        pending_data = self.pending_txt_uploads[user_id]
+        videos = pending_data['videos']
+        event = pending_data['event']
+        progress_msg = pending_data['progress_msg']
+        
+        # Validate start position
+        if start_position < 1 or start_position > len(videos):
+            await self.safe_edit_message(progress_msg, 
+                f"❌ **Invalid start position**\n\n"
+                f"Please choose a number between 1 and {len(videos)}")
+            return
+        
+        # Get videos starting from specified position
+        selected_videos = videos[start_position - 1:]  # Convert to 0-based index
+        
+        await self.safe_edit_message(progress_msg, 
+            f"✅ **Starting upload from video #{start_position}**\n\n"
+            f"📊 **Processing {len(selected_videos)} videos**\n"
+            f"🔄 Adding to queue...")
+        
+        # Add each video to queue starting from specified position
+        for i, video in enumerate(selected_videos):
             upload_item = {
                 'type': 'm3u8',
                 'event': event,
@@ -454,7 +530,13 @@ class TelegramBot:
             
             self.upload_queues[user_id].append(upload_item)
         
-        await self.safe_edit_message(progress_msg, f"✅ **{len(videos)} videos added to queue**\n\n🔄 Processing will start automatically...")
+        await self.safe_edit_message(progress_msg, 
+            f"✅ **{len(selected_videos)} videos added to queue**\n\n"
+            f"🎯 **Started from video #{start_position}:** `{selected_videos[0]['name']}`\n"
+            f"🔄 **Processing will start automatically...**")
+        
+        # Clean up pending data
+        del self.pending_txt_uploads[user_id]
         
         # Start processing the queue
         await self.process_queue(user_id)
@@ -483,6 +565,7 @@ class TelegramBot:
                 "• Send multiple URLs - processed in order\n"
                 "• M3U8 stream downloads with FFmpeg\n"
                 "• TXT files with video lists (video_name : url format)\n"
+                "• Choose starting position for TXT uploads\n"
                 "• Real-time progress with speed display\n"
                 "• Queue system for batch uploads\n"
                 "• Flood wait protection\n\n"
@@ -515,12 +598,14 @@ class TelegramBot:
                 "3. **M3U8 Stream**: Send M3U8 URL for video download\n"
                 "4. **TXT Video List**: Send TXT file with format:\n"
                 "   `video_name : https://example.com/video.m3u8`\n"
-                "5. **Batch Upload**: Send multiple files/URLs - they'll queue automatically\n\n"
+                "5. **Batch Upload**: Send multiple files/URLs - they'll queue automatically\n"
+                "6. **Start Position**: For TXT files, choose where to start uploading\n\n"
                 "**Features:**\n"
                 "• Supports files up to 4GB\n"
                 "• M3U8 stream downloading with FFmpeg\n"
                 "• Real-time progress updates with speed\n"
                 "• Queue system for multiple uploads\n"
+                "• Resume TXT uploads from any position\n"
                 "• Flood wait protection for stability\n"
                 "• Direct upload to GitHub releases\n"
                 "• Returns download URL after upload\n\n"
@@ -613,11 +698,49 @@ class TelegramBot:
         @self.client.on(events.CallbackQuery)
         async def callback_handler(event):
             user_id = event.sender_id
+            data = event.data.decode('utf-8')
+            
+            # Handle TXT upload start position selection
+            if data.startswith('start_'):
+                if user_id not in self.pending_txt_uploads:
+                    await event.answer("This selection has expired", alert=True)
+                    return
+                
+                if data == 'start_all':
+                    await self.process_txt_start_selection(user_id, 1)
+                    await event.answer()
+                elif data == 'start_cancel':
+                    if user_id in self.pending_txt_uploads:
+                        progress_msg = self.pending_txt_uploads[user_id]['progress_msg']
+                        await self.safe_edit_message(progress_msg, "❌ **TXT upload cancelled**")
+                        del self.pending_txt_uploads[user_id]
+                    await event.answer()
+                elif data == 'start_custom':
+                    pending_data = self.pending_txt_uploads[user_id]
+                    progress_msg = pending_data['progress_msg']
+                    total_videos = len(pending_data['videos'])
+                    
+                    await self.safe_edit_message(progress_msg,
+                        f"✏️ **Custom Start Position**\n\n"
+                        f"📊 **Total videos:** {total_videos}\n\n"
+                        f"📝 **Send a number (1-{total_videos}) to start from that position**\n"
+                        f"Example: Send `5` to start from video #5\n\n"
+                        f"⏰ This selection will expire in 2 minutes if not used.")
+                    await event.answer()
+                else:
+                    # Extract number from start_X
+                    try:
+                        start_num = int(data.split('_')[1])
+                        await self.process_txt_start_selection(user_id, start_num)
+                        await event.answer()
+                    except (ValueError, IndexError):
+                        await event.answer("Invalid selection", alert=True)
+                return
+            
+            # Admin-only callback handling
             if not self.is_admin(user_id):
                 await event.answer("Access denied", alert=True)
                 return
-            
-            data = event.data.decode('utf-8')
             
             if data.startswith('list_page_'):
                 page = int(data.split('_')[2])
@@ -896,6 +1019,15 @@ class TelegramBot:
             # Check if processes are stopped
             if self.should_stop:
                 await event.respond("🛑 **Bot is currently stopped**\n\nPlease wait for an administrator to restart the bot using /restart command.")
+                return
+
+            # Handle custom start position for TXT uploads
+            if (user_id in self.pending_txt_uploads and 
+                event.message.text and 
+                event.message.text.strip().isdigit()):
+                
+                start_position = int(event.message.text.strip())
+                await self.process_txt_start_selection(user_id, start_position)
                 return
 
             try:
