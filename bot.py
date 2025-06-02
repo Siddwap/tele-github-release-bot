@@ -1,7 +1,10 @@
+
 import asyncio
 import logging
 import os
 import tempfile
+import subprocess
+import re
 from datetime import datetime
 from typing import Optional, BinaryIO, Dict, List
 from collections import deque
@@ -9,6 +12,7 @@ import aiohttp
 from telethon import TelegramClient, events
 from telethon.tl.types import DocumentAttributeFilename
 from telethon.tl.custom import Button
+from telethon.errors import FloodWaitError
 from dotenv import load_dotenv
 from github_uploader import GitHubUploader
 from config import BotConfig
@@ -39,6 +43,7 @@ class TelegramBot:
         self.processing_queues: Dict[int, bool] = {}  # User ID -> is processing
         self.should_stop = False  # Flag to control stopping processes
         self.active_sessions: Dict[int, List] = {}  # User ID -> list of active aiohttp sessions
+        self.flood_wait_delay = 1  # Initial delay between operations to avoid flood wait
 
     def is_admin(self, user_id: int) -> bool:
         """Check if user is admin"""
@@ -71,6 +76,7 @@ class TelegramBot:
     async def restart_all_processes(self):
         """Restart all processes"""
         self.should_stop = False
+        self.flood_wait_delay = 1  # Reset flood wait delay
         logger.info("All processes restarted by admin command")
 
     def add_active_session(self, user_id: int, session):
@@ -112,6 +118,104 @@ class TelegramBot:
         else:
             return name_part
 
+    def is_m3u8_url(self, url: str) -> bool:
+        """Check if URL is an M3U8 stream"""
+        return url.lower().endswith('.m3u8') or 'm3u8' in url.lower()
+
+    def parse_txt_file_content(self, content: str) -> List[Dict[str, str]]:
+        """Parse TXT file content to extract video names and URLs"""
+        videos = []
+        lines = content.strip().split('\n')
+        
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            
+            # Try to parse "video_name : url" format
+            if ':' in line:
+                parts = line.split(':', 1)
+                if len(parts) == 2:
+                    name = parts[0].strip()
+                    url = parts[1].strip()
+                    
+                    # Validate URL
+                    if url.startswith(('http://', 'https://')):
+                        # Sanitize filename and ensure it has .mp4 extension
+                        if not name.lower().endswith('.mp4'):
+                            name += '.mp4'
+                        sanitized_name = self.sanitize_filename(name)
+                        videos.append({'name': sanitized_name, 'url': url})
+            else:
+                # Treat the whole line as URL and generate filename
+                if line.startswith(('http://', 'https://')):
+                    filename = f"video_{len(videos) + 1}.mp4"
+                    videos.append({'name': filename, 'url': line})
+        
+        return videos
+
+    async def download_m3u8_with_ffmpeg(self, url: str, output_path: str, progress_msg, filename: str):
+        """Download M3U8 stream using ffmpeg with progress tracking"""
+        try:
+            # Use ffmpeg to download M3U8 stream
+            cmd = [
+                'ffmpeg',
+                '-i', url,
+                '-c', 'copy',
+                '-bsf:a', 'aac_adtstoasc',
+                '-y',  # Overwrite output file
+                output_path
+            ]
+            
+            # Start ffmpeg process
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True
+            )
+            
+            start_time = time.time()
+            last_update = start_time
+            
+            # Monitor progress
+            while True:
+                if self.should_stop:
+                    process.terminate()
+                    raise Exception("Download stopped by admin command")
+                
+                # Check if process is still running
+                if process.poll() is not None:
+                    break
+                
+                current_time = time.time()
+                elapsed = current_time - start_time
+                
+                # Update progress message every 5 seconds
+                if current_time - last_update >= 5:
+                    await progress_msg.edit(
+                        f"📹 **Downloading M3U8 Stream...**\n\n"
+                        f"📁 {filename}\n"
+                        f"⏱️ Time: {elapsed:.0f}s\n"
+                        f"🔄 Processing stream segments..."
+                    )
+                    last_update = current_time
+                
+                await asyncio.sleep(1)
+            
+            # Check if download was successful
+            if process.returncode == 0:
+                # Get file size
+                file_size = os.path.getsize(output_path)
+                return file_size
+            else:
+                stderr_output = process.stderr.read() if process.stderr else "Unknown error"
+                raise Exception(f"FFmpeg failed: {stderr_output}")
+                
+        except Exception as e:
+            logger.error(f"Error downloading M3U8: {e}")
+            raise
+
     async def add_to_queue(self, user_id: int, upload_item: dict):
         """Add upload item to user's queue"""
         if self.should_stop:
@@ -123,8 +227,35 @@ class TelegramBot:
         self.upload_queues[user_id].append(upload_item)
         await self.process_queue(user_id)
 
+    async def handle_flood_wait(self, func, *args, **kwargs):
+        """Handle flood wait errors with exponential backoff"""
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                return await func(*args, **kwargs)
+            except FloodWaitError as e:
+                if attempt == max_retries - 1:
+                    raise
+                
+                wait_time = e.seconds + self.flood_wait_delay
+                logger.warning(f"Flood wait detected, waiting {wait_time} seconds (attempt {attempt + 1})")
+                await asyncio.sleep(wait_time)
+                
+                # Increase delay for next operation
+                self.flood_wait_delay = min(self.flood_wait_delay * 2, 60)
+            except Exception as e:
+                raise
+
+    async def safe_edit_message(self, message, text, **kwargs):
+        """Safely edit message with flood wait handling"""
+        return await self.handle_flood_wait(message.edit, text, **kwargs)
+
+    async def safe_respond(self, event, text, **kwargs):
+        """Safely respond to event with flood wait handling"""
+        return await self.handle_flood_wait(event.respond, text, **kwargs)
+
     async def process_queue(self, user_id: int):
-        """Process upload queue for a user"""
+        """Process upload queue for a user with flood wait protection"""
         if self.should_stop or (user_id in self.processing_queues and self.processing_queues[user_id]):
             return  # Already processing or stopped
         
@@ -138,15 +269,29 @@ class TelegramBot:
                 upload_item = self.upload_queues[user_id].popleft()
                 
                 # Update active uploads
+                remaining_count = len(self.upload_queues[user_id])
                 self.active_uploads[user_id] = {
                     'filename': upload_item['filename'],
-                    'status': f"Processing... ({len(self.upload_queues[user_id])} remaining in queue)"
+                    'status': f"Processing... ({remaining_count} remaining in queue)"
                 }
                 
-                if upload_item['type'] == 'file':
-                    await self.process_file_upload(upload_item)
-                elif upload_item['type'] == 'url':
-                    await self.process_url_upload(upload_item)
+                try:
+                    if upload_item['type'] == 'file':
+                        await self.process_file_upload(upload_item)
+                    elif upload_item['type'] == 'url':
+                        await self.process_url_upload(upload_item)
+                    elif upload_item['type'] == 'm3u8':
+                        await self.process_m3u8_upload(upload_item)
+                    elif upload_item['type'] == 'txt_m3u8':
+                        await self.process_txt_m3u8_upload(upload_item)
+                    
+                    # Add delay between queue items to prevent flood wait
+                    if self.upload_queues[user_id]:  # If more items in queue
+                        await asyncio.sleep(self.flood_wait_delay)
+                        
+                except Exception as e:
+                    logger.error(f"Error processing queue item: {e}")
+                    # Continue with next item instead of stopping entire queue
                 
         except Exception as e:
             logger.error(f"Error processing queue for user {user_id}: {e}")
@@ -163,7 +308,7 @@ class TelegramBot:
         file_size = upload_item['file_size']
         user_id = upload_item['user_id']
         
-        progress_msg = await event.respond("📥 **Downloading from Telegram...**\n⏳ Starting...")
+        progress_msg = await self.safe_respond(event, "📥 **Downloading from Telegram...**\n⏳ Starting...")
         
         # Use temporary file for streaming
         with tempfile.NamedTemporaryFile(delete=False) as temp_file:
@@ -172,13 +317,13 @@ class TelegramBot:
                 await self.download_telegram_file_streaming(document, temp_file, progress_msg, filename)
                 
                 # Upload to GitHub from temporary file
-                await progress_msg.edit("📤 **Uploading to GitHub...**\n⏳ Starting...")
+                await self.safe_edit_message(progress_msg, "📤 **Uploading to GitHub...**\n⏳ Starting...")
                 download_url = await self.upload_to_github_streaming(temp_file.name, filename, file_size, progress_msg)
                 
                 remaining = len(self.upload_queues.get(user_id, []))
                 queue_text = f"\n\n📋 **Queue:** {remaining} files remaining" if remaining > 0 else ""
                 
-                await progress_msg.edit(
+                await self.safe_edit_message(progress_msg,
                     f"✅ **Upload Complete!**\n\n"
                     f"📁 **File:** `{filename}`\n"
                     f"📊 **Size:** {self.format_size(file_size)}\n"
@@ -187,7 +332,7 @@ class TelegramBot:
                 
             except Exception as e:
                 logger.error(f"Error uploading file: {e}")
-                await progress_msg.edit(f"❌ **Upload Failed**\n\nError: {str(e)}")
+                await self.safe_edit_message(progress_msg, f"❌ **Upload Failed**\n\nError: {str(e)}")
             finally:
                 # Clean up temporary file
                 try:
@@ -202,7 +347,7 @@ class TelegramBot:
         filename = upload_item['filename']
         user_id = upload_item['user_id']
         
-        progress_msg = await event.respond("📥 **Downloading from URL...**\n⏳ Starting...")
+        progress_msg = await self.safe_respond(event, "📥 **Downloading from URL...**\n⏳ Starting...")
         
         # Use temporary file for streaming
         with tempfile.NamedTemporaryFile(delete=False) as temp_file:
@@ -211,13 +356,13 @@ class TelegramBot:
                 file_size = await self.download_from_url_streaming(url, temp_file, progress_msg, filename)
                 
                 # Upload to GitHub from temporary file
-                await progress_msg.edit("📤 **Uploading to GitHub...**\n⏳ Starting...")
+                await self.safe_edit_message(progress_msg, "📤 **Uploading to GitHub...**\n⏳ Starting...")
                 download_url = await self.upload_to_github_streaming(temp_file.name, filename, file_size, progress_msg)
                 
                 remaining = len(self.upload_queues.get(user_id, []))
                 queue_text = f"\n\n📋 **Queue:** {remaining} files remaining" if remaining > 0 else ""
                 
-                await progress_msg.edit(
+                await self.safe_edit_message(progress_msg,
                     f"✅ **Upload Complete!**\n\n"
                     f"📁 **File:** `{filename}`\n"
                     f"📊 **Size:** {self.format_size(file_size)}\n"
@@ -226,13 +371,93 @@ class TelegramBot:
                 
             except Exception as e:
                 logger.error(f"Error processing URL: {e}")
-                await progress_msg.edit(f"❌ **Upload Failed**\n\nError: {str(e)}")
+                await self.safe_edit_message(progress_msg, f"❌ **Upload Failed**\n\nError: {str(e)}")
             finally:
                 # Clean up temporary file
                 try:
                     os.unlink(temp_file.name)
                 except:
                     pass
+
+    async def process_m3u8_upload(self, upload_item: dict):
+        """Process a single M3U8 upload from queue"""
+        event = upload_item['event']
+        url = upload_item['url']
+        filename = upload_item['filename']
+        user_id = upload_item['user_id']
+        
+        progress_msg = await self.safe_respond(event, "📹 **Downloading M3U8 Stream...**\n⏳ Starting...")
+        
+        # Use temporary file for M3U8 download
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as temp_file:
+            try:
+                # Download M3U8 with ffmpeg
+                file_size = await self.download_m3u8_with_ffmpeg(url, temp_file.name, progress_msg, filename)
+                
+                # Upload to GitHub from temporary file
+                await self.safe_edit_message(progress_msg, "📤 **Uploading to GitHub...**\n⏳ Starting...")
+                download_url = await self.upload_to_github_streaming(temp_file.name, filename, file_size, progress_msg)
+                
+                remaining = len(self.upload_queues.get(user_id, []))
+                queue_text = f"\n\n📋 **Queue:** {remaining} files remaining" if remaining > 0 else ""
+                
+                await self.safe_edit_message(progress_msg,
+                    f"✅ **M3U8 Upload Complete!**\n\n"
+                    f"📁 **File:** `{filename}`\n"
+                    f"📊 **Size:** {self.format_size(file_size)}\n"
+                    f"🔗 **Download URL:**\n{download_url}{queue_text}"
+                )
+                
+            except Exception as e:
+                logger.error(f"Error processing M3U8: {e}")
+                await self.safe_edit_message(progress_msg, f"❌ **M3U8 Upload Failed**\n\nError: {str(e)}")
+            finally:
+                # Clean up temporary file
+                try:
+                    os.unlink(temp_file.name)
+                except:
+                    pass
+
+    async def process_txt_m3u8_upload(self, upload_item: dict):
+        """Process TXT file containing M3U8 URLs"""
+        event = upload_item['event']
+        document = upload_item['document']
+        user_id = upload_item['user_id']
+        
+        progress_msg = await self.safe_respond(event, "📄 **Processing TXT file...**\n⏳ Reading content...")
+        
+        # Download TXT file content
+        txt_content = await self.client.download_media(document, file=bytes)
+        txt_content = txt_content.decode('utf-8')
+        
+        # Parse TXT file to extract video URLs
+        videos = self.parse_txt_file_content(txt_content)
+        
+        if not videos:
+            await self.safe_edit_message(progress_msg, "❌ **No valid URLs found in TXT file**\n\nExpected format: video_name : https://example.com/video.m3u8")
+            return
+        
+        await self.safe_edit_message(progress_msg, f"📋 **Found {len(videos)} videos in TXT file**\n\n⏳ Adding to queue...")
+        
+        # Add each video to queue
+        for i, video in enumerate(videos):
+            upload_item = {
+                'type': 'm3u8',
+                'event': event,
+                'url': video['url'],
+                'filename': video['name'],
+                'user_id': user_id
+            }
+            
+            if user_id not in self.upload_queues:
+                self.upload_queues[user_id] = deque()
+            
+            self.upload_queues[user_id].append(upload_item)
+        
+        await self.safe_edit_message(progress_msg, f"✅ **{len(videos)} videos added to queue**\n\n🔄 Processing will start automatically...")
+        
+        # Start processing the queue
+        await self.process_queue(user_id)
 
     async def start(self):
         """Start the bot"""
@@ -256,11 +481,16 @@ class TelegramBot:
                 "**Features:**\n"
                 "• Send multiple files - they'll upload one by one\n"
                 "• Send multiple URLs - processed in order\n"
+                "• M3U8 stream downloads with FFmpeg\n"
+                "• TXT files with video lists (video_name : url format)\n"
                 "• Real-time progress with speed display\n"
-                "• Queue system for batch uploads\n\n"
+                "• Queue system for batch uploads\n"
+                "• Flood wait protection\n\n"
                 "**Commands:**\n"
                 "• Send any file (up to 4GB)\n"
                 "• Send a URL to download and upload\n"
+                "• Send M3U8 stream URL for video download\n"
+                "• Send TXT file with video list\n"
                 "• /help - Show this message\n"
                 "• /status - Check upload status\n"
                 "• /queue - Check queue status\n" +
@@ -282,11 +512,16 @@ class TelegramBot:
                 "**How to use:**\n\n"
                 "1. **File Upload**: Send any file directly to the bot\n"
                 "2. **URL Upload**: Send a URL pointing to a file\n"
-                "3. **Batch Upload**: Send multiple files/URLs - they'll queue automatically\n\n"
+                "3. **M3U8 Stream**: Send M3U8 URL for video download\n"
+                "4. **TXT Video List**: Send TXT file with format:\n"
+                "   `video_name : https://example.com/video.m3u8`\n"
+                "5. **Batch Upload**: Send multiple files/URLs - they'll queue automatically\n\n"
                 "**Features:**\n"
                 "• Supports files up to 4GB\n"
+                "• M3U8 stream downloading with FFmpeg\n"
                 "• Real-time progress updates with speed\n"
                 "• Queue system for multiple uploads\n"
+                "• Flood wait protection for stability\n"
                 "• Direct upload to GitHub releases\n"
                 "• Returns download URL after upload\n\n"
                 f"**Target Repository:** `{self.config.github_repo}`\n"
@@ -673,7 +908,10 @@ class TelegramBot:
                 if event.message.text:
                     text = event.message.text.strip()
                     if self.is_url(text):
-                        await self.handle_url_upload(event)
+                        if self.is_m3u8_url(text):
+                            await self.handle_m3u8_upload(event)
+                        else:
+                            await self.handle_url_upload(event)
                         return
                     
                     # Only respond to non-empty text that's not a URL or command
@@ -682,7 +920,9 @@ class TelegramBot:
                             "❓ **Invalid Input**\n\n"
                             "Please send:\n"
                             "• A file (drag & drop or attach)\n"
-                            "• A direct download URL\n\n"
+                            "• A direct download URL\n"
+                            "• An M3U8 stream URL\n"
+                            "• A TXT file with video list\n\n"
                             "Use /help for more information."
                         )
                 
@@ -716,6 +956,21 @@ class TelegramBot:
             if isinstance(attr, DocumentAttributeFilename):
                 filename = attr.file_name
                 break
+        
+        # Check if it's a TXT file with M3U8 URLs
+        if filename.lower().endswith('.txt'):
+            # Add to queue as TXT M3U8 processing
+            upload_item = {
+                'type': 'txt_m3u8',
+                'event': event,
+                'document': document,
+                'filename': filename,
+                'user_id': user_id
+            }
+            
+            await event.respond(f"📄 **TXT File Received**\n\n📁 **File:** `{filename}`\n🔄 **Processing video list...**")
+            await self.add_to_queue(user_id, upload_item)
+            return
         
         # Sanitize filename to avoid GitHub upload issues
         sanitized_filename = self.sanitize_filename(filename)
@@ -776,6 +1031,41 @@ class TelegramBot:
         
         await self.add_to_queue(user_id, upload_item)
 
+    async def handle_m3u8_upload(self, event):
+        """Handle M3U8 URL upload by adding to queue"""
+        user_id = event.sender_id
+        url = event.message.text.strip()
+        
+        # Extract filename from URL or generate one
+        filename = url.split('/')[-1] or f"stream_{int(time.time())}"
+        if '?' in filename:
+            filename = filename.split('?')[0]
+        
+        # Ensure .mp4 extension for M3U8 downloads
+        if not filename.lower().endswith('.mp4'):
+            filename = filename.replace('.m3u8', '.mp4') if filename.endswith('.m3u8') else f"{filename}.mp4"
+        
+        # Sanitize filename
+        sanitized_filename = self.sanitize_filename(filename)
+        if sanitized_filename != filename:
+            logger.info(f"Sanitized filename: '{filename}' -> '{sanitized_filename}'")
+        
+        logger.info(f"Queuing M3U8: {url}")
+        
+        # Add to queue
+        upload_item = {
+            'type': 'm3u8',
+            'event': event,
+            'url': url,
+            'filename': sanitized_filename,
+            'user_id': user_id
+        }
+        
+        queue_position = len(self.upload_queues.get(user_id, [])) + 1
+        await event.respond(f"📹 **M3U8 Stream Queued**\n\n🔗 **URL:** `{url}`\n📁 **File:** `{sanitized_filename}`\n🔢 **Position:** {queue_position}")
+        
+        await self.add_to_queue(user_id, upload_item)
+
     async def download_telegram_file_streaming(self, document, temp_file, progress_msg, filename: str):
         """Download file from Telegram with progress and speed using streaming to temp file - OPTIMIZED"""
         total_size = document.size
@@ -802,7 +1092,7 @@ class TelegramBot:
             
             # Update every 2% progress or every 2 seconds
             if progress - getattr(progress_callback, 'last_progress', 0) >= 2 or time_diff >= 2:
-                await progress_msg.edit(
+                await self.safe_edit_message(progress_msg,
                     f"📥 **Downloading from Telegram...**\n\n"
                     f"📁 {filename}\n"
                     f"📊 {self.format_size(current)} / {self.format_size(total)}\n"
@@ -878,7 +1168,7 @@ class TelegramBot:
                         
                         # Update every 2% progress or every 2 seconds
                         if progress - getattr(self, '_last_url_progress', 0) >= 2 or time_diff >= 2:
-                            await progress_msg.edit(
+                            await self.safe_edit_message(progress_msg,
                                 f"📥 **Downloading from URL...**\n\n"
                                 f"📁 {filename}\n"
                                 f"📊 {self.format_size(downloaded)} / {self.format_size(total_size)}\n"
@@ -922,7 +1212,7 @@ class TelegramBot:
             
             # Update every 2% progress or every 2 seconds
             if progress - getattr(progress_callback, 'last_progress', 0) >= 2 or time_diff >= 2:
-                await progress_msg.edit(
+                await self.safe_edit_message(progress_msg,
                     f"📤 **Uploading to GitHub...**\n\n"
                     f"📁 {filename}\n"
                     f"📊 {self.format_size(current)} / {self.format_size(file_size)}\n"
