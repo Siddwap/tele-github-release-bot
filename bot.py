@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 import os
@@ -189,14 +188,15 @@ class TelegramBot:
         return updated_videos
 
     async def download_m3u8_with_ffmpeg(self, url: str, output_path: str, progress_msg, filename: str):
-        """Download M3U8 stream using ffmpeg with progress tracking"""
+        """Download M3U8 stream using ffmpeg with progress tracking showing speed and percentage"""
         try:
-            # Use ffmpeg to download M3U8 stream
+            # Use ffmpeg to download M3U8 stream with progress output
             cmd = [
                 'ffmpeg',
                 '-i', url,
                 '-c', 'copy',
                 '-bsf:a', 'aac_adtstoasc',
+                '-progress', 'pipe:1',  # Output progress to stdout
                 '-y',  # Overwrite output file
                 output_path
             ]
@@ -211,8 +211,11 @@ class TelegramBot:
             
             start_time = time.time()
             last_update = start_time
+            last_size = 0
+            total_duration = None
+            current_time_pos = 0
             
-            # Monitor progress
+            # Monitor progress by reading ffmpeg output
             while True:
                 if self.should_stop:
                     process.terminate()
@@ -222,25 +225,79 @@ class TelegramBot:
                 if process.poll() is not None:
                     break
                 
-                current_time = time.time()
-                elapsed = current_time - start_time
+                # Read a line from stdout
+                line = process.stdout.readline()
+                if line:
+                    line = line.strip()
+                    
+                    # Parse ffmpeg progress output
+                    if line.startswith('out_time_ms='):
+                        try:
+                            time_ms = int(line.split('=')[1])
+                            current_time_pos = time_ms / 1000000  # Convert to seconds
+                        except (ValueError, IndexError):
+                            pass
+                    elif line.startswith('total_size='):
+                        try:
+                            current_size = int(line.split('=')[1])
+                            current_time = time.time()
+                            
+                            # Calculate download speed
+                            time_diff = current_time - last_update
+                            size_diff = current_size - last_size
+                            speed = size_diff / time_diff if time_diff > 0 else 0
+                            
+                            # Calculate percentage if we have duration info
+                            percentage = 0
+                            if total_duration and total_duration > 0:
+                                percentage = min((current_time_pos / total_duration) * 100, 100)
+                            
+                            # Update progress message every 2 seconds
+                            if time_diff >= 2:
+                                progress_bar = '█' * int(percentage // 5) + '░' * (20 - int(percentage // 5))
+                                
+                                await self.safe_edit_message(progress_msg,
+                                    f"📹 **Downloading M3U8 Stream...**\n\n"
+                                    f"📁 {filename}\n"
+                                    f"📊 Size: {self.format_size(current_size)}\n"
+                                    f"⏳ Progress: {percentage:.1f}%\n"
+                                    f"🚀 Speed: {self.format_size(speed)}/s\n"
+                                    f"{progress_bar}"
+                                )
+                                last_update = current_time
+                                last_size = current_size
+                        except (ValueError, IndexError):
+                            pass
+                    elif line.startswith('Duration:') and total_duration is None:
+                        # Extract total duration from ffmpeg output
+                        try:
+                            duration_str = line.split('Duration: ')[1].split(',')[0]
+                            time_parts = duration_str.split(':')
+                            if len(time_parts) == 3:
+                                hours = float(time_parts[0])
+                                minutes = float(time_parts[1])
+                                seconds = float(time_parts[2])
+                                total_duration = hours * 3600 + minutes * 60 + seconds
+                        except (ValueError, IndexError):
+                            pass
                 
-                # Update progress message every 5 seconds
-                if current_time - last_update >= 5:
-                    await self.safe_edit_message(progress_msg,
-                        f"📹 **Downloading M3U8 Stream...**\n\n"
-                        f"📁 {filename}\n"
-                        f"⏱️ Time: {elapsed:.0f}s\n"
-                        f"🔄 Processing stream segments..."
-                    )
-                    last_update = current_time
-                
-                await asyncio.sleep(1)
+                # Small delay to prevent excessive CPU usage
+                await asyncio.sleep(0.1)
             
             # Check if download was successful
             if process.returncode == 0:
-                # Get file size
+                # Get final file size
                 file_size = os.path.getsize(output_path)
+                
+                # Show completion message
+                await self.safe_edit_message(progress_msg,
+                    f"✅ **M3U8 Download Complete!**\n\n"
+                    f"📁 {filename}\n"
+                    f"📊 Final Size: {self.format_size(file_size)}\n"
+                    f"⏳ Progress: 100%\n"
+                    f"🎯 Ready for GitHub upload..."
+                )
+                
                 return file_size
             else:
                 stderr_output = process.stderr.read() if process.stderr else "Unknown error"
