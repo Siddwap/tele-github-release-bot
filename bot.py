@@ -45,6 +45,7 @@ class TelegramBot:
         self.active_sessions: Dict[int, List] = {}  # User ID -> list of active aiohttp sessions
         self.flood_wait_delay = 1  # Initial delay between operations to avoid flood wait
         self.pending_txt_uploads: Dict[int, Dict] = {}  # User ID -> pending TXT upload data
+        self.pending_course_name: Dict[int, Dict] = {}  # User ID -> pending course name data
 
     def is_admin(self, user_id: int) -> bool:
         """Check if user is admin"""
@@ -74,6 +75,9 @@ class TelegramBot:
         
         # Clear pending TXT uploads
         self.pending_txt_uploads.clear()
+        
+        # Clear pending course name data
+        self.pending_course_name.clear()
         
         logger.info("All processes stopped by admin command")
 
@@ -158,6 +162,32 @@ class TelegramBot:
         
         return videos
 
+    def apply_course_name_to_videos(self, videos: List[Dict[str, str]], course_name: str) -> List[Dict[str, str]]:
+        """Apply course name to video filenames"""
+        if not course_name or course_name.lower() == 'no':
+            return videos
+        
+        # Sanitize course name
+        sanitized_course_name = self.sanitize_filename(course_name)
+        
+        updated_videos = []
+        for video in videos:
+            original_name = video['name']
+            
+            # Split name and extension
+            if '.' in original_name:
+                name_part = '.'.join(original_name.split('.')[:-1])
+                extension = original_name.split('.')[-1]
+                new_name = f"{name_part}_{sanitized_course_name}.{extension}"
+            else:
+                new_name = f"{original_name}_{sanitized_course_name}"
+            
+            updated_video = video.copy()
+            updated_video['name'] = new_name
+            updated_videos.append(updated_video)
+        
+        return updated_videos
+
     async def download_m3u8_with_ffmpeg(self, url: str, output_path: str, progress_msg, filename: str):
         """Download M3U8 stream using ffmpeg with progress tracking"""
         try:
@@ -197,7 +227,7 @@ class TelegramBot:
                 
                 # Update progress message every 5 seconds
                 if current_time - last_update >= 5:
-                    await progress_msg.edit(
+                    await self.safe_edit_message(progress_msg,
                         f"📹 **Downloading M3U8 Stream...**\n\n"
                         f"📁 {filename}\n"
                         f"⏱️ Time: {elapsed:.0f}s\n"
@@ -423,7 +453,7 @@ class TelegramBot:
                     pass
 
     async def process_txt_m3u8_upload(self, upload_item: dict):
-        """Process TXT file containing M3U8 URLs with start position option"""
+        """Process TXT file containing M3U8 URLs with course name and start position option"""
         event = upload_item['event']
         document = upload_item['document']
         user_id = upload_item['user_id']
@@ -441,7 +471,82 @@ class TelegramBot:
             await self.safe_edit_message(progress_msg, "❌ **No valid URLs found in TXT file**\n\nExpected format: video_name : https://example.com/video.m3u8")
             return
         
-        # Store parsed videos for this user
+        # Store parsed videos for course name selection
+        self.pending_course_name[user_id] = {
+            'videos': videos,
+            'event': event,
+            'progress_msg': progress_msg
+        }
+        
+        # Create video list for user to see
+        video_list = ""
+        for i, video in enumerate(videos[:10], 1):  # Show first 10 videos
+            video_list += f"**{i}.** `{video['name']}`\n"
+        
+        if len(videos) > 10:
+            video_list += f"... and {len(videos) - 10} more videos"
+        
+        # Create buttons for course name selection
+        buttons = [
+            [Button.inline("📚 Add Course Name", "course_yes")],
+            [Button.inline("❌ No Course Name", "course_no")]
+        ]
+        
+        await self.safe_edit_message(progress_msg,
+            f"📋 **Found {len(videos)} videos in TXT file**\n\n"
+            f"📝 **Video List:**\n{video_list}\n\n"
+            f"📚 **Add course name to video filenames?**\n"
+            f"This will append course name to each video name.\n"
+            f"Example: `class_1.mp4` → `class_1_math_course.mp4`",
+            buttons=buttons
+        )
+
+    async def process_course_name_selection(self, user_id: int, add_course_name: bool):
+        """Process course name selection for TXT upload"""
+        if user_id not in self.pending_course_name:
+            return
+        
+        pending_data = self.pending_course_name[user_id]
+        videos = pending_data['videos']
+        event = pending_data['event']
+        progress_msg = pending_data['progress_msg']
+        
+        if add_course_name:
+            await self.safe_edit_message(progress_msg,
+                f"📚 **Enter Course Name**\n\n"
+                f"📝 **Send the course name** to append to video filenames\n"
+                f"Example: Send `Math Course` to rename videos like:\n"
+                f"• `class_1.mp4` → `class_1_Math_Course.mp4`\n"
+                f"• `lesson_2.mp4` → `lesson_2_Math_Course.mp4`\n\n"
+                f"⏰ This selection will expire in 3 minutes if not used."
+            )
+        else:
+            # Skip course name, proceed to start position selection
+            await self.show_start_position_selection(user_id, videos, event, progress_msg)
+            # Clean up pending course name data
+            del self.pending_course_name[user_id]
+
+    async def process_course_name_input(self, user_id: int, course_name: str):
+        """Process course name input and proceed to start position selection"""
+        if user_id not in self.pending_course_name:
+            return
+        
+        pending_data = self.pending_course_name[user_id]
+        videos = pending_data['videos']
+        event = pending_data['event']
+        progress_msg = pending_data['progress_msg']
+        
+        # Apply course name to videos
+        updated_videos = self.apply_course_name_to_videos(videos, course_name)
+        
+        await self.show_start_position_selection(user_id, updated_videos, event, progress_msg)
+        
+        # Clean up pending course name data
+        del self.pending_course_name[user_id]
+
+    async def show_start_position_selection(self, user_id: int, videos: List[Dict[str, str]], event, progress_msg):
+        """Show start position selection for TXT upload"""
+        # Store updated videos for start position selection
         self.pending_txt_uploads[user_id] = {
             'videos': videos,
             'event': event,
@@ -483,8 +588,8 @@ class TelegramBot:
         buttons.append([Button.inline("❌ Cancel", "start_cancel")])
         
         await self.safe_edit_message(progress_msg,
-            f"📋 **Found {len(videos)} videos in TXT file**\n\n"
-            f"📝 **Video List:**\n{video_list}\n\n"
+            f"📋 **Ready to upload {len(videos)} videos**\n\n"
+            f"📝 **Final Video List:**\n{video_list}\n\n"
             f"🎯 **Where to start uploading?**\n"
             f"Choose a number to start from that position:",
             buttons=buttons
@@ -565,6 +670,7 @@ class TelegramBot:
                 "• Send multiple URLs - processed in order\n"
                 "• M3U8 stream downloads with FFmpeg\n"
                 "• TXT files with video lists (video_name : url format)\n"
+                "• Add course names to video filenames\n"
                 "• Choose starting position for TXT uploads\n"
                 "• Real-time progress with speed display\n"
                 "• Queue system for batch uploads\n"
@@ -599,12 +705,14 @@ class TelegramBot:
                 "4. **TXT Video List**: Send TXT file with format:\n"
                 "   `video_name : https://example.com/video.m3u8`\n"
                 "5. **Batch Upload**: Send multiple files/URLs - they'll queue automatically\n"
-                "6. **Start Position**: For TXT files, choose where to start uploading\n\n"
+                "6. **Course Names**: Add course names to video filenames from TXT files\n"
+                "7. **Start Position**: For TXT files, choose where to start uploading\n\n"
                 "**Features:**\n"
                 "• Supports files up to 4GB\n"
                 "• M3U8 stream downloading with FFmpeg\n"
                 "• Real-time progress updates with speed\n"
                 "• Queue system for multiple uploads\n"
+                "• Course name appending for organized uploads\n"
                 "• Resume TXT uploads from any position\n"
                 "• Flood wait protection for stability\n"
                 "• Direct upload to GitHub releases\n"
@@ -699,6 +807,20 @@ class TelegramBot:
         async def callback_handler(event):
             user_id = event.sender_id
             data = event.data.decode('utf-8')
+            
+            # Handle course name selection
+            if data.startswith('course_'):
+                if user_id not in self.pending_course_name:
+                    await event.answer("This selection has expired", alert=True)
+                    return
+                
+                if data == 'course_yes':
+                    await self.process_course_name_selection(user_id, True)
+                    await event.answer()
+                elif data == 'course_no':
+                    await self.process_course_name_selection(user_id, False)
+                    await event.answer()
+                return
             
             # Handle TXT upload start position selection
             if data.startswith('start_'):
@@ -1019,6 +1141,15 @@ class TelegramBot:
             # Check if processes are stopped
             if self.should_stop:
                 await event.respond("🛑 **Bot is currently stopped**\n\nPlease wait for an administrator to restart the bot using /restart command.")
+                return
+
+            # Handle course name input for TXT uploads
+            if (user_id in self.pending_course_name and 
+                event.message.text and 
+                not event.message.document):
+                
+                course_name = event.message.text.strip()
+                await self.process_course_name_input(user_id, course_name)
                 return
 
             # Handle custom start position for TXT uploads
