@@ -1,386 +1,982 @@
+import asyncio
 import logging
 import os
-from telegram import Update
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
+import tempfile
+from datetime import datetime
+from typing import Optional, BinaryIO, Dict, List
+from collections import deque
 import aiohttp
-from github_uploader import GitHubUploader  # Import the GitHubUploader class
+from telethon import TelegramClient, events
+from telethon.tl.types import DocumentAttributeFilename
+from telethon.tl.custom import Button
+from dotenv import load_dotenv
+from github_uploader import GitHubUploader
+from config import BotConfig
+import time
 
-# Set up logging
+load_dotenv()
+
+# Configure logging
 logging.basicConfig(
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    handlers=[
+        logging.FileHandler('bot.log'),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
 class TelegramBot:
-    def __init__(self, telegram_token: str, github_token: str, github_repo: str, github_release_tag: str):
-        self.telegram_token = telegram_token
-        self.github_token = github_token
-        self.github_repo = github_repo
-        self.github_release_tag = github_release_tag
-        self.github_uploader = None  # Initialize as None
-        self.app = ApplicationBuilder().token(self.telegram_token).build()
-        self.register_handlers()
+    def __init__(self):
+        self.config = BotConfig.from_env()
+        self.config.validate()
         
-        # Initialize GitHub uploader only when needed
-        if all([self.github_token, self.github_repo, self.github_release_tag]):
-            self.github_uploader = GitHubUploader(
-                token=self.github_token,
-                repo=self.github_repo,
-                release_tag=self.github_release_tag
-            )
+        self.client = TelegramClient('bot', self.config.telegram_api_id, self.config.telegram_api_hash)
+        self.github_uploader = GitHubUploader(self.config.github_token, self.config.github_repo, self.config.github_release_tag)
+        self.active_uploads = {}
+        self.upload_queues: Dict[int, deque] = {}  # User ID -> queue of uploads
+        self.processing_queues: Dict[int, bool] = {}  # User ID -> is processing
+        self.should_stop = False  # Flag to control stopping processes
+        self.active_sessions: Dict[int, List] = {}  # User ID -> list of active aiohttp sessions
 
-    def register_handlers(self):
-        """Register all command and message handlers."""
-        start_handler = CommandHandler('start', self.start)
-        help_handler = CommandHandler('help', self.help_command)
-        upload_handler = CommandHandler('upload', self.upload_file)
-        list_handler = CommandHandler('list', self.list_files)
-        delete_handler = CommandHandler('delete', self.handle_delete_command)
-        rename_handler = CommandHandler('rename', self.handle_rename_command)
-        message_handler = MessageHandler(filters.TEXT & (~filters.COMMAND), self.handle_text_message)
+    def is_admin(self, user_id: int) -> bool:
+        """Check if user is admin"""
+        return self.config.is_admin(user_id)
 
-        self.app.add_handler(start_handler)
-        self.app.add_handler(help_handler)
-        self.app.add_handler(upload_handler)
-        self.app.add_handler(list_handler)
-        self.app.add_handler(delete_handler)
-        self.app.add_handler(rename_handler)
-        self.app.add_handler(message_handler)
+    async def stop_all_processes(self):
+        """Stop all running processes"""
+        self.should_stop = True
+        
+        # Cancel all active aiohttp sessions
+        for user_id, sessions in self.active_sessions.items():
+            for session in sessions:
+                if not session.closed:
+                    await session.close()
+        self.active_sessions.clear()
+        
+        # Clear all queues
+        for user_id in list(self.upload_queues.keys()):
+            self.upload_queues[user_id].clear()
+        
+        # Stop processing
+        for user_id in list(self.processing_queues.keys()):
+            self.processing_queues[user_id] = False
+        
+        # Clear active uploads
+        self.active_uploads.clear()
+        
+        logger.info("All processes stopped by admin command")
 
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Send a welcome message when the /start command is issued."""
-        await update.message.reply_text('Hello! I am your GitHub Release Asset Uploader Bot. Use /help to see available commands.')
+    async def restart_all_processes(self):
+        """Restart all processes"""
+        self.should_stop = False
+        logger.info("All processes restarted by admin command")
 
-    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Send a help message with available commands."""
-        help_text = (
-            "Available commands:\n"
-            "/start - Start the bot\n"
-            "/help - Show this help message\n"
-            "/upload - Upload a file to GitHub Release\n"
-            "/list - List all assets in the release\n"
-            "/delete - Delete a file from the release\n"
-            "/rename - Rename a file in the release"
-        )
-        await update.message.reply_text(help_text)
+    def add_active_session(self, user_id: int, session):
+        """Add an active session for tracking"""
+        if user_id not in self.active_sessions:
+            self.active_sessions[user_id] = []
+        self.active_sessions[user_id].append(session)
 
-    async def upload_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle the /upload command to upload a file to GitHub Release."""
+    def remove_active_session(self, user_id: int, session):
+        """Remove an active session"""
+        if user_id in self.active_sessions and session in self.active_sessions[user_id]:
+            self.active_sessions[user_id].remove(session)
+
+    def sanitize_filename(self, filename: str) -> str:
+        """Sanitize filename by replacing special characters while preserving extension"""
+        import re
+        
+        # Split filename and extension
+        if '.' in filename:
+            name_part = '.'.join(filename.split('.')[:-1])
+            extension = filename.split('.')[-1]
+        else:
+            name_part = filename
+            extension = ''
+        
+        # Replace special characters with safe alternatives
+        # Keep only alphanumeric, spaces, dots, hyphens, and underscores
+        name_part = re.sub(r'[^\w\s\-_.]', '_', name_part)
+        
+        # Replace multiple spaces/underscores with single underscore
+        name_part = re.sub(r'[\s_]+', '_', name_part)
+        
+        # Remove leading/trailing underscores
+        name_part = name_part.strip('_')
+        
+        # Reconstruct filename with extension
+        if extension:
+            return f"{name_part}.{extension}"
+        else:
+            return name_part
+
+    async def add_to_queue(self, user_id: int, upload_item: dict):
+        """Add upload item to user's queue"""
+        if self.should_stop:
+            return
+            
+        if user_id not in self.upload_queues:
+            self.upload_queues[user_id] = deque()
+        
+        self.upload_queues[user_id].append(upload_item)
+        await self.process_queue(user_id)
+
+    async def process_queue(self, user_id: int):
+        """Process upload queue for a user"""
+        if self.should_stop or (user_id in self.processing_queues and self.processing_queues[user_id]):
+            return  # Already processing or stopped
+        
+        if user_id not in self.upload_queues or not self.upload_queues[user_id]:
+            return  # No items in queue
+        
+        self.processing_queues[user_id] = True
+        
         try:
-            if not self.github_uploader:
-                await update.message.reply_text("❌ GitHub uploader not configured!")
-                return
+            while self.upload_queues[user_id] and not self.should_stop:
+                upload_item = self.upload_queues[user_id].popleft()
+                
+                # Update active uploads
+                self.active_uploads[user_id] = {
+                    'filename': upload_item['filename'],
+                    'status': f"Processing... ({len(self.upload_queues[user_id])} remaining in queue)"
+                }
+                
+                if upload_item['type'] == 'file':
+                    await self.process_file_upload(upload_item)
+                elif upload_item['type'] == 'url':
+                    await self.process_url_upload(upload_item)
+                
+        except Exception as e:
+            logger.error(f"Error processing queue for user {user_id}: {e}")
+        finally:
+            self.processing_queues[user_id] = False
+            if user_id in self.active_uploads:
+                del self.active_uploads[user_id]
 
-            # Check if the user has sent a file with the command
-            if not update.message.document:
-                await update.message.reply_text("❌ Please attach a file to upload.")
-                return
-
-            file = update.message.document
-            file_name = file.file_name
-            file_size = file.file_size
-            file_id = file.file_id
-
-            # Download the file
-            new_file = await context.bot.get_file(file_id)
-            file_bytes = await new_file.download_as_bytearray()
-            file_data = bytes(file_bytes)
-
-            # Upload the file to GitHub Release
-            await update.message.reply_text(f"📤 Uploading {file_name}...")
+    async def process_file_upload(self, upload_item: dict):
+        """Process a single file upload from queue"""
+        event = upload_item['event']
+        document = upload_item['document']
+        filename = upload_item['filename']
+        file_size = upload_item['file_size']
+        user_id = upload_item['user_id']
+        
+        progress_msg = await event.respond("📥 **Downloading from Telegram...**\n⏳ Starting...")
+        
+        # Use temporary file for streaming
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
             try:
-                download_url = await self.github_uploader.upload_asset(file_data, file_name)
-                await update.message.reply_text(f"✅ Successfully uploaded {file_name}!\n🔗 Download URL: {download_url}")
+                # Download file with progress to temporary file
+                await self.download_telegram_file_streaming(document, temp_file, progress_msg, filename)
+                
+                # Upload to GitHub from temporary file
+                await progress_msg.edit("📤 **Uploading to GitHub...**\n⏳ Starting...")
+                download_url = await self.upload_to_github_streaming(temp_file.name, filename, file_size, progress_msg)
+                
+                remaining = len(self.upload_queues.get(user_id, []))
+                queue_text = f"\n\n📋 **Queue:** {remaining} files remaining" if remaining > 0 else ""
+                
+                await progress_msg.edit(
+                    f"✅ **Upload Complete!**\n\n"
+                    f"📁 **File:** `{filename}`\n"
+                    f"📊 **Size:** {self.format_size(file_size)}\n"
+                    f"🔗 **Download URL:**\n{download_url}{queue_text}"
+                )
+                
             except Exception as e:
                 logger.error(f"Error uploading file: {e}")
-                await update.message.reply_text(f"❌ Failed to upload {file_name}: {str(e)}")
-
-        except Exception as e:
-            logger.error(f"Error in upload command: {e}")
-            await update.message.reply_text(f"❌ Error: {str(e)}")
-
-    async def list_files(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle the /list command to list files in GitHub Release."""
-        try:
-            if not self.github_uploader:
-                await update.message.reply_text("❌ GitHub uploader not configured!")
-                return
-
-            await update.message.reply_text("📂 Fetching list of files...")
-            assets = await self.github_uploader.list_release_assets()
-
-            if not assets:
-                await update.message.reply_text("📂 No files found in the release.")
-                return
-
-            message = "📂 Files in the release:\n"
-            for asset in assets:
-                size_mb = asset['size'] / (1024 * 1024)
-                message += f"- {asset['name']} ({size_mb:.1f} MB)\n"
-
-            await update.message.reply_text(message)
-
-        except Exception as e:
-            logger.error(f"Error in list command: {e}")
-            await update.message.reply_text(f"❌ Error: {str(e)}")
-
-    async def handle_delete_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle the /delete command"""
-        try:
-            if not self.github_uploader:
-                await update.message.reply_text("❌ GitHub uploader not configured!")
-                return
-
-            # Get list of assets
-            assets = await self.github_uploader.list_release_assets()
-            
-            if not assets:
-                await update.message.reply_text("📂 No files found to delete!")
-                return
-
-            # Show numbered list for deletion
-            message = "📂 Available files for deletion:\n\n"
-            for i, asset in enumerate(assets[:20], 1):  # Show max 20 files
-                size_mb = asset['size'] / (1024 * 1024)
-                message += f"{i}. {asset['name']} ({size_mb:.1f} MB)\n"
-            
-            if len(assets) > 20:
-                message += f"\n... and {len(assets) - 20} more files\n"
-            
-            message += "\n💡 Send the file number(s) to delete (e.g., '1' or '1,2,3' or 'all'):"
-            
-            await update.message.reply_text(message)
-            
-            # Store assets in context for the next message
-            context.user_data['delete_assets'] = assets
-            context.user_data['awaiting_delete'] = True
-
-        except Exception as e:
-            logger.error(f"Error in delete command: {e}")
-            await update.message.reply_text(f"❌ Error: {str(e)}")
-
-    async def handle_rename_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle the /rename command"""
-        try:
-            if not self.github_uploader:
-                await update.message.reply_text("❌ GitHub uploader not configured!")
-                return
-
-            # Get list of assets
-            assets = await self.github_uploader.list_release_assets()
-            
-            if not assets:
-                await update.message.reply_text("📂 No files found to rename!")
-                return
-
-            # Show numbered list for renaming
-            message = "📂 Available files for renaming:\n\n"
-            for i, asset in enumerate(assets[:20], 1):  # Show max 20 files
-                size_mb = asset['size'] / (1024 * 1024)
-                message += f"{i}. {asset['name']} ({size_mb:.1f} MB)\n"
-            
-            if len(assets) > 20:
-                message += f"\n... and {len(assets) - 20} more files\n"
-            
-            message += "\n💡 Send the file number to rename (e.g., '1'):"
-            
-            await update.message.reply_text(message)
-            
-            # Store assets in context for the next message
-            context.user_data['rename_assets'] = assets
-            context.user_data['awaiting_rename'] = True
-
-        except Exception as e:
-            logger.error(f"Error in rename command: {e}")
-            await update.message.reply_text(f"❌ Error: {str(e)}")
-
-    async def handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle text messages"""
-        try:
-            text = update.message.text.strip()
-            
-            # Check if user is responding to delete command
-            if context.user_data.get('awaiting_delete'):
-                await self.process_delete_selection(update, context, text)
-                return
-            
-            # Check if user is responding to rename command
-            if context.user_data.get('awaiting_rename'):
-                await self.process_rename_selection(update, context, text)
-                return
-            
-            # Check if user is providing new name for rename
-            if context.user_data.get('awaiting_rename_newname'):
-                await self.process_rename_newname(update, context, text)
-                return
-
-            # Handle URL
-            if text.startswith("http://") or text.startswith("https://"):
-                await update.message.reply_text("🔗 URL detected.  Please use /upload command to upload files.")
-            else:
-                await update.message.reply_text("💬 I am here to help you manage your GitHub Release assets.  Use /help to see available commands.")
-
-        except Exception as e:
-            logger.error(f"Error handling text message: {e}")
-            await update.message.reply_text(f"❌ Error: {str(e)}")
-
-    async def process_delete_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-        """Process delete file selection"""
-        try:
-            assets = context.user_data.get('delete_assets', [])
-            
-            if text.lower() == 'all':
-                # Delete all files
-                total_files = len(assets)
-                success_count = 0
-                failed_count = 0
-                
-                status_message = await update.message.reply_text("🗑️ Starting deletion process...")
-                
-                for i, asset in enumerate(assets, 1):
-                    try:
-                        success = await self.github_uploader.delete_asset_by_name(asset['name'])
-                        if success:
-                            success_count += 1
-                        else:
-                            failed_count += 1
-                        
-                        # Update progress every 5 files
-                        if i % 5 == 0 or i == total_files:
-                            await status_message.edit_text(
-                                f"🗑️ Deleting files... {i}/{total_files}\n"
-                                f"✅ Deleted: {success_count}\n"
-                                f"❌ Failed: {failed_count}"
-                            )
-                    except Exception as e:
-                        logger.error(f"Error deleting {asset['name']}: {e}")
-                        failed_count += 1
-                
-                final_message = (
-                    f"✅ Deletion Complete!\n\n"
-                    f"📊 Total files: {total_files}\n"
-                    f"✅ Successfully deleted: {success_count}\n"
-                    f"❌ Failed: {failed_count}"
-                )
-                await status_message.edit_text(final_message)
-            
-            else:
-                # Parse specific file numbers
+                await progress_msg.edit(f"❌ **Upload Failed**\n\nError: {str(e)}")
+            finally:
+                # Clean up temporary file
                 try:
-                    file_numbers = [int(x.strip()) for x in text.split(',')]
-                    success_count = 0
-                    failed_count = 0
-                    
-                    for num in file_numbers:
-                        if 1 <= num <= len(assets):
-                            asset = assets[num - 1]
-                            try:
-                                success = await self.github_uploader.delete_asset_by_name(asset['name'])
-                                if success:
-                                    success_count += 1
-                                    await update.message.reply_text(f"✅ Deleted: {asset['name']}")
-                                else:
-                                    failed_count += 1
-                                    await update.message.reply_text(f"❌ Failed to delete: {asset['name']}")
-                            except Exception as e:
-                                failed_count += 1
-                                await update.message.reply_text(f"❌ Error deleting {asset['name']}: {str(e)}")
-                        else:
-                            await update.message.reply_text(f"❌ Invalid file number: {num}")
-                    
-                    await update.message.reply_text(
-                        f"🏁 Deletion Summary:\n"
-                        f"✅ Successfully deleted: {success_count}\n"
-                        f"❌ Failed: {failed_count}"
-                    )
+                    os.unlink(temp_file.name)
+                except:
+                    pass
+
+    async def process_url_upload(self, upload_item: dict):
+        """Process a single URL upload from queue"""
+        event = upload_item['event']
+        url = upload_item['url']
+        filename = upload_item['filename']
+        user_id = upload_item['user_id']
+        
+        progress_msg = await event.respond("📥 **Downloading from URL...**\n⏳ Starting...")
+        
+        # Use temporary file for streaming
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            try:
+                # Download from URL with progress to temporary file
+                file_size = await self.download_from_url_streaming(url, temp_file, progress_msg, filename)
                 
-                except ValueError:
-                    await update.message.reply_text("❌ Invalid input! Please send numbers separated by commas (e.g., '1,2,3') or 'all'")
-                    return
-            
-            # Clear the context
-            context.user_data.pop('delete_assets', None)
-            context.user_data.pop('awaiting_delete', None)
+                # Upload to GitHub from temporary file
+                await progress_msg.edit("📤 **Uploading to GitHub...**\n⏳ Starting...")
+                download_url = await self.upload_to_github_streaming(temp_file.name, filename, file_size, progress_msg)
+                
+                remaining = len(self.upload_queues.get(user_id, []))
+                queue_text = f"\n\n📋 **Queue:** {remaining} files remaining" if remaining > 0 else ""
+                
+                await progress_msg.edit(
+                    f"✅ **Upload Complete!**\n\n"
+                    f"📁 **File:** `{filename}`\n"
+                    f"📊 **Size:** {self.format_size(file_size)}\n"
+                    f"🔗 **Download URL:**\n{download_url}{queue_text}"
+                )
+                
+            except Exception as e:
+                logger.error(f"Error processing URL: {e}")
+                await progress_msg.edit(f"❌ **Upload Failed**\n\nError: {str(e)}")
+            finally:
+                # Clean up temporary file
+                try:
+                    os.unlink(temp_file.name)
+                except:
+                    pass
 
-        except Exception as e:
-            logger.error(f"Error processing delete selection: {e}")
-            await update.message.reply_text(f"❌ Error: {str(e)}")
-
-    async def process_rename_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-        """Process rename file selection"""
+    async def start(self):
+        """Start the bot"""
         try:
-            assets = context.user_data.get('rename_assets', [])
+            await self.client.start(bot_token=self.config.telegram_bot_token)
+            logger.info("Bot started successfully")
+        except Exception as e:
+            logger.error(f"Failed to start bot: {e}")
+            raise
+        
+        @self.client.on(events.NewMessage(pattern='/start'))
+        async def start_handler(event):
+            user_id = event.sender_id
+            is_admin = self.is_admin(user_id)
+            admin_status = "**Admin User**" if is_admin else "**Regular User**"
+            
+            await event.respond(
+                f"🤖 **GitHub Release Uploader Bot**\n\n"
+                f"👤 {admin_status}\n\n"
+                "Send me files or URLs to upload to GitHub release!\n\n"
+                "**Features:**\n"
+                "• Send multiple files - they'll upload one by one\n"
+                "• Send multiple URLs - processed in order\n"
+                "• Real-time progress with speed display\n"
+                "• Queue system for batch uploads\n\n"
+                "**Commands:**\n"
+                "• Send any file (up to 4GB)\n"
+                "• Send a URL to download and upload\n"
+                "• /help - Show this message\n"
+                "• /status - Check upload status\n"
+                "• /queue - Check queue status\n" +
+                ("• /list - List files in release with navigation (Admin only)\n"
+                "• /search <filename> - Search files by name (Admin only)\n"
+                "• /delete <number> - Delete file by list number (Admin only)\n"
+                "• /rename <number> <new_filename> - Rename file (Admin only)\n"
+                "• /stop - Stop all processes (Admin only)\n"
+                "• /restart - Restart all processes (Admin only)" if is_admin else "")
+            )
+            raise events.StopPropagation
+
+        @self.client.on(events.NewMessage(pattern='/help'))
+        async def help_handler(event):
+            user_id = event.sender_id
+            is_admin = self.is_admin(user_id)
+            
+            basic_help = (
+                "**How to use:**\n\n"
+                "1. **File Upload**: Send any file directly to the bot\n"
+                "2. **URL Upload**: Send a URL pointing to a file\n"
+                "3. **Batch Upload**: Send multiple files/URLs - they'll queue automatically\n\n"
+                "**Features:**\n"
+                "• Supports files up to 4GB\n"
+                "• Real-time progress updates with speed\n"
+                "• Queue system for multiple uploads\n"
+                "• Direct upload to GitHub releases\n"
+                "• Returns download URL after upload\n\n"
+                f"**Target Repository:** `{self.config.github_repo}`\n"
+                f"**Release Tag:** `{self.config.github_release_tag}`"
+            )
+            
+            admin_help = (
+                "\n\n**Admin Commands:**\n"
+                "• /list - Browse files with navigation buttons\n"
+                "• /search <filename> - Search files by name\n"
+                "• /delete <number> - Remove file by list number\n"
+                "• /rename <number> <new_name> - Rename file by list number\n"
+                "• /stop - Stop all running processes\n"
+                "• /restart - Restart all processes\n\n"
+                "**Examples:**\n"
+                "• /list - Browse files with Previous/Next buttons\n"
+                "• /search video.mp4 - Find files containing 'video.mp4'\n"
+                "• /delete 5 - Delete file number 5 from list\n"
+                "• /rename 5 new_video.mp4 - Rename file number 5"
+            )
+            
+            help_text = basic_help + (admin_help if is_admin else "")
+            await event.respond(help_text)
+            raise events.StopPropagation
+
+        @self.client.on(events.NewMessage(pattern='/stop'))
+        async def stop_handler(event):
+            user_id = event.sender_id
+            if not self.is_admin(user_id):
+                await event.respond("❌ **Access Denied**\n\nThis command is only available to administrators.")
+                raise events.StopPropagation
+            
+            await self.stop_all_processes()
+            await event.respond("🛑 **All processes stopped**\n\nAll uploads, queues, and active processes have been halted.\n\nUse /restart to resume operations.")
+            raise events.StopPropagation
+
+        @self.client.on(events.NewMessage(pattern='/restart'))
+        async def restart_handler(event):
+            user_id = event.sender_id
+            if not self.is_admin(user_id):
+                await event.respond("❌ **Access Denied**\n\nThis command is only available to administrators.")
+                raise events.StopPropagation
+            
+            await self.restart_all_processes()
+            await event.respond("✅ **Bot restarted successfully**\n\nAll processes are now running normally.")
+            raise events.StopPropagation
+
+        @self.client.on(events.NewMessage(pattern='/status'))
+        async def status_handler(event):
+            user_id = event.sender_id
+            if user_id in self.active_uploads:
+                upload_info = self.active_uploads[user_id]
+                await event.respond(f"📊 Active upload: {upload_info['filename']} - {upload_info['status']}")
+            else:
+                await event.respond("No active uploads")
+            raise events.StopPropagation
+
+        @self.client.on(events.NewMessage(pattern='/queue'))
+        async def queue_handler(event):
+            user_id = event.sender_id
+            if user_id in self.upload_queues and self.upload_queues[user_id]:
+                queue_count = len(self.upload_queues[user_id])
+                queue_items = []
+                for i, item in enumerate(list(self.upload_queues[user_id])[:5]):  # Show first 5
+                    queue_items.append(f"{i+1}. {item['filename']}")
+                
+                queue_text = "\n".join(queue_items)
+                if queue_count > 5:
+                    queue_text += f"\n... and {queue_count - 5} more"
+                
+                await event.respond(f"📋 **Upload Queue ({queue_count} items):**\n\n{queue_text}")
+            else:
+                await event.respond("📋 Queue is empty")
+            raise events.StopPropagation
+
+        @self.client.on(events.NewMessage(pattern='/list'))
+        async def list_handler(event):
+            user_id = event.sender_id
+            if not self.is_admin(user_id):
+                await event.respond("❌ **Access Denied**\n\nThis command is only available to administrators.")
+                raise events.StopPropagation
             
             try:
-                file_number = int(text.strip())
-                if 1 <= file_number <= len(assets):
-                    selected_asset = assets[file_number - 1]
-                    context.user_data['rename_selected_asset'] = selected_asset
-                    context.user_data['awaiting_rename_newname'] = True
-                    context.user_data.pop('awaiting_rename', None)
-                    
-                    await update.message.reply_text(
-                        f"📝 Selected file: {selected_asset['name']}\n\n"
-                        f"💡 Please send the new filename:"
-                    )
-                else:
-                    await update.message.reply_text(f"❌ Invalid file number: {file_number}")
-            
-            except ValueError:
-                await update.message.reply_text("❌ Invalid input! Please send a file number (e.g., '1')")
+                await send_file_list(event, page=1)
+            except Exception as e:
+                await event.respond(f"❌ **Error listing files**\n\n{str(e)}")
+            raise events.StopPropagation
 
-        except Exception as e:
-            logger.error(f"Error processing rename selection: {e}")
-            await update.message.reply_text(f"❌ Error: {str(e)}")
-
-    async def process_rename_newname(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-        """Process new filename for rename"""
-        try:
-            selected_asset = context.user_data.get('rename_selected_asset')
-            new_filename = text.strip()
-            
-            if not new_filename:
-                await update.message.reply_text("❌ Filename cannot be empty!")
+        @self.client.on(events.CallbackQuery)
+        async def callback_handler(event):
+            user_id = event.sender_id
+            if not self.is_admin(user_id):
+                await event.answer("Access denied", alert=True)
                 return
             
-            old_filename = selected_asset['name']
+            data = event.data.decode('utf-8')
             
-            status_message = await update.message.reply_text(f"🔄 Renaming '{old_filename}' to '{new_filename}'...")
+            if data.startswith('list_page_'):
+                page = int(data.split('_')[2])
+                await send_file_list(event, page, edit=True)
+                await event.answer()
+            elif data == 'close_list':
+                await event.delete()
+                await event.answer()
+
+        async def send_file_list(event, page=1, edit=False):
+            """Send file list with pagination buttons"""
+            assets = await self.github_uploader.list_release_assets()
+            if not assets:
+                if edit:
+                    await event.edit("📂 **No files found in release**")
+                else:
+                    await event.respond("📂 **No files found in release**")
+                return
+            
+            # Pagination logic
+            per_page = 20
+            total_pages = (len(assets) + per_page - 1) // per_page
+            start_idx = (page - 1) * per_page
+            end_idx = start_idx + per_page
+            page_assets = assets[start_idx:end_idx]
+            
+            if not page_assets:
+                if edit:
+                    await event.edit(f"📂 **Page {page} not found**\n\nTotal pages: {total_pages}")
+                else:
+                    await event.respond(f"📂 **Page {page} not found**\n\nTotal pages: {total_pages}")
+                return
+            
+            response = f"📂 **Files in Release (Page {page}/{total_pages}):**\n\n"
+            
+            for i, asset in enumerate(page_assets, start=start_idx + 1):
+                size_mb = asset['size'] / (1024 * 1024)
+                response += f"**{i}.** `{asset['name']}`\n"
+                response += f"   📊 Size: {size_mb:.1f} MB\n"
+                response += f"   🔗 [Download]({asset['browser_download_url']})\n\n"
+            
+            # Add total info
+            response += f"📄 **Total:** {len(assets)} files | **Page:** {page}/{total_pages}\n"
+            response += f"🗑️ Use `/delete <number>` to delete a file\n"
+            response += f"✏️ Use `/rename <number> <new_name>` to rename a file"
+            
+            # Create navigation buttons
+            buttons = []
+            nav_row = []
+            
+            # Previous page button
+            if page > 1:
+                nav_row.append(Button.inline("◀️ Previous", f"list_page_{page-1}"))
+            
+            # Next page button
+            if page < total_pages:
+                nav_row.append(Button.inline("Next ▶️", f"list_page_{page+1}"))
+            
+            if nav_row:
+                buttons.append(nav_row)
+            
+            # Close button
+            buttons.append([Button.inline("❌ Close", "close_list")])
+            
+            if edit:
+                await event.edit(response, buttons=buttons)
+            else:
+                await event.respond(response, buttons=buttons)
+
+        # Store the method in the class for access in callback handler
+        self.send_file_list = send_file_list
+
+        @self.client.on(events.NewMessage(pattern=r'/search (.+)'))
+        async def search_handler(event):
+            user_id = event.sender_id
+            if not self.is_admin(user_id):
+                await event.respond("❌ **Access Denied**\n\nThis command is only available to administrators.")
+                raise events.StopPropagation
             
             try:
-                # Use the fast rename method
-                success = await self.github_uploader.rename_asset_fast(old_filename, new_filename)
+                search_term = event.pattern_match.group(1).strip().lower()
+                if not search_term:
+                    await event.respond("❌ **Usage:** /search <filename>")
+                    return
                 
-                if success:
-                    await status_message.edit_text(f"✅ Successfully renamed '{old_filename}' to '{new_filename}'")
-                else:
-                    await status_message.edit_text(f"❌ Failed to rename '{old_filename}'")
-            
+                assets = await self.github_uploader.list_release_assets()
+                if not assets:
+                    await event.respond("📂 **No files found in release**")
+                    return
+                
+                # Filter assets by search term
+                matching_assets = []
+                for i, asset in enumerate(assets, 1):
+                    if search_term in asset['name'].lower():
+                        matching_assets.append((i, asset))
+                
+                if not matching_assets:
+                    await event.respond(f"🔍 **No files found matching:** `{search_term}`")
+                    return
+                
+                response = f"🔍 **Search Results for:** `{search_term}`\n\n"
+                
+                for original_num, asset in matching_assets[:20]:  # Limit to 20 results
+                    size_mb = asset['size'] / (1024 * 1024)
+                    response += f"**{original_num}.** `{asset['name']}`\n"
+                    response += f"   📊 Size: {size_mb:.1f} MB\n"
+                    response += f"   🔗 [Download]({asset['browser_download_url']})\n\n"
+                
+                if len(matching_assets) > 20:
+                    response += f"... and {len(matching_assets) - 20} more results\n\n"
+                
+                response += f"📊 **Found:** {len(matching_assets)} files\n"
+                response += f"🗑️ Use `/delete <number>` to delete a file"
+                
+                await event.respond(response)
+                
             except Exception as e:
-                await status_message.edit_text(f"❌ Rename Error: {str(e)}")
+                await event.respond(f"❌ **Error searching files**\n\n{str(e)}")
+            raise events.StopPropagation
+
+        @self.client.on(events.NewMessage(pattern=r'/delete (.+)'))
+        async def delete_handler(event):
+            user_id = event.sender_id
+            if not self.is_admin(user_id):
+                await event.respond("❌ **Access Denied**\n\nThis command is only available to administrators.")
+                raise events.StopPropagation
             
-            # Clear the context
-            context.user_data.pop('rename_assets', None)
-            context.user_data.pop('rename_selected_asset', None)
-            context.user_data.pop('awaiting_rename_newname', None)
+            try:
+                delete_args = event.pattern_match.group(1).strip()
+                file_numbers = self.parse_delete_numbers(delete_args)
+                
+                if not file_numbers:
+                    await event.respond("❌ **Invalid format**\n\nExamples:\n• /delete 5\n• /delete 1,3,5\n• /delete 1-5\n• /delete 1-3,7,9-12")
+                    return
+                
+                assets = await self.github_uploader.list_release_assets()
+                if not assets:
+                    await event.respond("📂 **No files found in release**")
+                    return
+                
+                # Validate all file numbers
+                invalid_numbers = [num for num in file_numbers if num < 1 or num > len(assets)]
+                if invalid_numbers:
+                    await event.respond(f"❌ **Invalid file numbers:** {', '.join(map(str, invalid_numbers))}\n\nValid range: 1-{len(assets)}")
+                    return
+                
+                # Remove duplicates and sort in descending order (delete from end to avoid index shifting)
+                file_numbers = sorted(set(file_numbers), reverse=True)
+                
+                # Get files to delete
+                files_to_delete = []
+                for num in file_numbers:
+                    asset = assets[num - 1]  # Convert to 0-based index
+                    files_to_delete.append((num, asset['name']))
+                
+                # Confirm deletion
+                if len(files_to_delete) == 1:
+                    confirm_msg = f"🗑️ **Delete 1 file?**\n\n**{files_to_delete[0][0]}.** `{files_to_delete[0][1]}`"
+                else:
+                    file_list = "\n".join([f"**{num}.** `{name}`" for num, name in files_to_delete[:10]])
+                    if len(files_to_delete) > 10:
+                        file_list += f"\n... and {len(files_to_delete) - 10} more files"
+                    confirm_msg = f"🗑️ **Delete {len(files_to_delete)} files?**\n\n{file_list}"
+                
+                progress_msg = await event.respond(f"{confirm_msg}\n\n⏳ **Starting deletion...**")
+                
+                # Delete files
+                deleted_count = 0
+                failed_files = []
+                
+                for i, (num, filename) in enumerate(files_to_delete, 1):
+                    try:
+                        success = await self.github_uploader.delete_asset_by_name(filename)
+                        if success:
+                            deleted_count += 1
+                        else:
+                            failed_files.append(f"{num}. {filename}")
+                        
+                        # Update progress
+                        await progress_msg.edit(
+                            f"{confirm_msg}\n\n"
+                            f"⏳ **Progress:** {i}/{len(files_to_delete)} files processed\n"
+                            f"✅ **Deleted:** {deleted_count} files"
+                        )
+                        
+                    except Exception as e:
+                        failed_files.append(f"{num}. {filename} (Error: {str(e)})")
+                
+                # Final result
+                result_msg = f"✅ **Deletion Complete**\n\n📊 **Successfully deleted:** {deleted_count}/{len(files_to_delete)} files"
+                
+                if failed_files:
+                    failed_list = "\n".join(failed_files[:5])
+                    if len(failed_files) > 5:
+                        failed_list += f"\n... and {len(failed_files) - 5} more"
+                    result_msg += f"\n\n❌ **Failed to delete:**\n{failed_list}"
+                
+                await progress_msg.edit(result_msg)
+                
+            except ValueError:
+                await event.respond("❌ **Invalid format**\n\nExamples:\n• /delete 5\n• /delete 1,3,5\n• /delete 1-5\n• /delete 1-3,7,9-12")
+            except Exception as e:
+                await event.respond(f"❌ **Error deleting files**\n\n{str(e)}")
+            raise events.StopPropagation
 
+        @self.client.on(events.NewMessage(pattern=r'/rename (\d+) (.+)'))
+        async def rename_handler(event):
+            user_id = event.sender_id
+            if not self.is_admin(user_id):
+                await event.respond("❌ **Access Denied**\n\nThis command is only available to administrators.")
+                raise events.StopPropagation
+            
+            try:
+                file_number = int(event.pattern_match.group(1))
+                new_filename = event.pattern_match.group(2).strip()
+                
+                if file_number < 1:
+                    await event.respond("❌ **Invalid file number**\n\nFile numbers start from 1")
+                    return
+                
+                if not new_filename:
+                    await event.respond("❌ **Invalid filename**\n\nPlease provide a valid new filename")
+                    return
+                
+                # Sanitize the new filename
+                sanitized_filename = self.sanitize_filename(new_filename)
+                if sanitized_filename != new_filename:
+                    await event.respond(f"ℹ️ **Filename sanitized:** `{new_filename}` -> `{sanitized_filename}`")
+                
+                assets = await self.github_uploader.list_release_assets()
+                if not assets:
+                    await event.respond("📂 **No files found in release**")
+                    return
+                
+                if file_number > len(assets):
+                    await event.respond(f"❌ **File number {file_number} not found**\n\nTotal files: {len(assets)}")
+                    return
+                
+                # Get the asset to rename (subtract 1 for 0-based indexing)
+                target_asset = assets[file_number - 1]
+                old_filename = target_asset['name']
+                
+                # Check if new filename already exists
+                for asset in assets:
+                    if asset['name'] == sanitized_filename:
+                        await event.respond(f"❌ **Filename already exists**\n\n📁 **File:** `{sanitized_filename}`")
+                        return
+                
+                progress_msg = await event.respond(f"🔄 **Renaming file...**\n\n📁 **From:** `{old_filename}`\n📁 **To:** `{sanitized_filename}`")
+                
+                success = await self.github_uploader.rename_asset_fast(old_filename, sanitized_filename)
+                if success:
+                    await progress_msg.edit(
+                        f"✅ **File renamed successfully**\n\n"
+                        f"📁 **File #{file_number}**\n"
+                        f"🔄 **From:** `{old_filename}`\n"
+                        f"🔄 **To:** `{sanitized_filename}`"
+                    )
+                else:
+                    await progress_msg.edit(f"❌ **Failed to rename file**\n\n📁 **File:** `{old_filename}`")
+                    
+            except ValueError:
+                await event.respond("❌ **Invalid command format**\n\nUsage: /rename <number> <new_filename>")
+            except Exception as e:
+                await event.respond(f"❌ **Error renaming file**\n\n{str(e)}")
+            raise events.StopPropagation
+
+        @self.client.on(events.NewMessage)
+        async def message_handler(event):
+            # Skip if it's a command (already handled by specific handlers)
+            if event.message.text and event.message.text.startswith('/'):
+                return
+            
+            user_id = event.sender_id
+
+            # Check if processes are stopped
+            if self.should_stop:
+                await event.respond("🛑 **Bot is currently stopped**\n\nPlease wait for an administrator to restart the bot using /restart command.")
+                return
+
+            try:
+                # Handle file uploads
+                if event.message.document:
+                    await self.handle_file_upload(event)
+                    return
+                
+                # Handle URL messages
+                if event.message.text:
+                    text = event.message.text.strip()
+                    if self.is_url(text):
+                        await self.handle_url_upload(event)
+                        return
+                    
+                    # Only respond to non-empty text that's not a URL or command
+                    if text and not text.startswith('/'):
+                        await event.respond(
+                            "❓ **Invalid Input**\n\n"
+                            "Please send:\n"
+                            "• A file (drag & drop or attach)\n"
+                            "• A direct download URL\n\n"
+                            "Use /help for more information."
+                        )
+                
+                # Ignore other message types (stickers, photos without documents, etc.)
+                
+            except Exception as e:
+                logger.error(f"Error handling message from user {user_id}: {e}")
+                await event.respond(f"❌ **Error**\n\nSomething went wrong: {str(e)}")
+
+        try:
+            await self.client.run_until_disconnected()
+        except KeyboardInterrupt:
+            logger.info("Bot stopped by user")
         except Exception as e:
-            logger.error(f"Error processing rename new name: {e}")
-            await update.message.reply_text(f"❌ Error: {str(e)}")
+            logger.error(f"Bot disconnected with error: {e}")
 
-    def run(self):
-        """Start the bot."""
-        self.app.run_polling()
+    def is_url(self, text: str) -> bool:
+        """Check if text is a valid URL"""
+        if not text:
+            return False
+        return text.startswith(('http://', 'https://')) and len(text) > 8
 
-if __name__ == '__main__':
-    telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    github_token = os.environ.get("GITHUB_TOKEN")
-    github_repo = os.environ.get("GITHUB_REPO")
-    github_release_tag = os.environ.get("GITHUB_RELEASE_TAG")
+    async def handle_file_upload(self, event):
+        """Handle file upload by adding to queue"""
+        user_id = event.sender_id
+        document = event.message.document
+        
+        # Get filename
+        filename = "unknown_file"
+        for attr in document.attributes:
+            if isinstance(attr, DocumentAttributeFilename):
+                filename = attr.file_name
+                break
+        
+        # Sanitize filename to avoid GitHub upload issues
+        sanitized_filename = self.sanitize_filename(filename)
+        if sanitized_filename != filename:
+            logger.info(f"Sanitized filename: '{filename}' -> '{sanitized_filename}'")
+        
+        file_size = document.size
+        logger.info(f"Queuing file: {sanitized_filename}, size: {file_size} bytes")
+        
+        # Check file size (4GB limit)
+        if file_size > 4 * 1024 * 1024 * 1024:
+            await event.respond("❌ File too large. Maximum size is 4GB.")
+            return
 
-    if not all([telegram_token, github_token, github_repo, github_release_tag]):
-        logger.error("❌ Missing required environment variables. Please set TELEGRAM_BOT_TOKEN, GITHUB_TOKEN, GITHUB_REPO, and GITHUB_RELEASE_TAG.")
-    else:
-        bot = TelegramBot(telegram_token, github_token, github_repo, github_release_tag)
-        bot.run()
+        # Add to queue
+        upload_item = {
+            'type': 'file',
+            'event': event,
+            'document': document,
+            'filename': sanitized_filename,
+            'file_size': file_size,
+            'user_id': user_id
+        }
+        
+        queue_position = len(self.upload_queues.get(user_id, [])) + 1
+        await event.respond(f"📋 **File Queued**\n\n📁 **File:** `{sanitized_filename}`\n📊 **Size:** {self.format_size(file_size)}\n🔢 **Position:** {queue_position}")
+        
+        await self.add_to_queue(user_id, upload_item)
+
+    async def handle_url_upload(self, event):
+        """Handle URL upload by adding to queue"""
+        user_id = event.sender_id
+        url = event.message.text.strip()
+        
+        # Extract filename from URL
+        filename = url.split('/')[-1] or f"download_{int(time.time())}"
+        if '?' in filename:
+            filename = filename.split('?')[0]
+        
+        # Sanitize filename to avoid GitHub upload issues
+        sanitized_filename = self.sanitize_filename(filename)
+        if sanitized_filename != filename:
+            logger.info(f"Sanitized filename: '{filename}' -> '{sanitized_filename}'")
+        
+        logger.info(f"Queuing URL: {url}")
+        
+        # Add to queue
+        upload_item = {
+            'type': 'url',
+            'event': event,
+            'url': url,
+            'filename': sanitized_filename,
+            'user_id': user_id
+        }
+        
+        queue_position = len(self.upload_queues.get(user_id, [])) + 1
+        await event.respond(f"📋 **URL Queued**\n\n🔗 **URL:** `{url}`\n📁 **File:** `{sanitized_filename}`\n🔢 **Position:** {queue_position}")
+        
+        await self.add_to_queue(user_id, upload_item)
+
+    async def download_telegram_file_streaming(self, document, temp_file, progress_msg, filename: str):
+        """Download file from Telegram with progress and speed using streaming to temp file - OPTIMIZED"""
+        total_size = document.size
+        downloaded = 0
+        start_time = time.time()
+        last_update_time = start_time
+        last_downloaded = 0
+        
+        async def progress_callback(current, total):
+            nonlocal downloaded, last_update_time, last_downloaded
+            
+            # Check if we should stop
+            if self.should_stop:
+                raise Exception("Upload stopped by admin command")
+            
+            downloaded = current
+            current_time = time.time()
+            progress = (current / total) * 100
+            
+            # Calculate speed
+            time_diff = current_time - last_update_time
+            bytes_diff = current - last_downloaded
+            speed = bytes_diff / time_diff if time_diff > 0 else 0
+            
+            # Update every 2% progress or every 2 seconds
+            if progress - getattr(progress_callback, 'last_progress', 0) >= 2 or time_diff >= 2:
+                await progress_msg.edit(
+                    f"📥 **Downloading from Telegram...**\n\n"
+                    f"📁 {filename}\n"
+                    f"📊 {self.format_size(current)} / {self.format_size(total)}\n"
+                    f"⏳ {progress:.1f}%\n"
+                    f"🚀 Speed: {self.format_size(speed)}/s\n"
+                    f"{'█' * int(progress // 5)}{'░' * (20 - int(progress // 5))}"
+                )
+                progress_callback.last_progress = progress
+                last_update_time = current_time
+                last_downloaded = current
+        
+        # Download file to temporary file using streaming
+        await self.client.download_media(
+            document, 
+            file=temp_file, 
+            progress_callback=progress_callback
+        )
+
+    async def download_from_url_streaming(self, url: str, temp_file, progress_msg, filename: str) -> int:
+        """Download file from URL with progress and speed using streaming to temp file - OPTIMIZED"""
+        # Optimized aiohttp session with better settings for high-speed downloads
+        timeout = aiohttp.ClientTimeout(total=None, connect=30)
+        connector = aiohttp.TCPConnector(
+            limit=100,
+            limit_per_host=30,
+            ttl_dns_cache=300,
+            use_dns_cache=True,
+            enable_cleanup_closed=True
+        )
+        
+        session = aiohttp.ClientSession(
+            timeout=timeout,
+            connector=connector,
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+        )
+        
+        # Track this session for potential cancellation
+        user_id = getattr(progress_msg, 'sender_id', 0)
+        self.add_active_session(user_id, session)
+        
+        try:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    raise Exception(f"Failed to download: HTTP {response.status}")
+                
+                total_size = int(response.headers.get('content-length', 0))
+                downloaded = 0
+                start_time = time.time()
+                last_update_time = start_time
+                last_downloaded = 0
+                
+                # Increased chunk size for better performance
+                chunk_size = 8 * 1024 * 1024  # 8MB chunks
+                
+                async for chunk in response.content.iter_chunked(chunk_size):
+                    # Check if we should stop
+                    if self.should_stop:
+                        raise Exception("Upload stopped by admin command")
+                    
+                    temp_file.write(chunk)
+                    downloaded += len(chunk)
+                    current_time = time.time()
+                    
+                    if total_size > 0:
+                        progress = (downloaded / total_size) * 100
+                        
+                        # Calculate speed
+                        time_diff = current_time - last_update_time
+                        bytes_diff = downloaded - last_downloaded
+                        speed = bytes_diff / time_diff if time_diff > 0 else 0
+                        
+                        # Update every 2% progress or every 2 seconds
+                        if progress - getattr(self, '_last_url_progress', 0) >= 2 or time_diff >= 2:
+                            await progress_msg.edit(
+                                f"📥 **Downloading from URL...**\n\n"
+                                f"📁 {filename}\n"
+                                f"📊 {self.format_size(downloaded)} / {self.format_size(total_size)}\n"
+                                f"⏳ {progress:.1f}%\n"
+                                f"🚀 Speed: {self.format_size(speed)}/s\n"
+                                f"{'█' * int(progress // 5)}{'░' * (20 - int(progress // 5))}"
+                            )
+                            self._last_url_progress = progress
+                            last_update_time = current_time
+                            last_downloaded = downloaded
+                
+                temp_file.flush()
+                return downloaded
+        finally:
+            self.remove_active_session(user_id, session)
+            if not session.closed:
+                await session.close()
+
+    async def upload_to_github_streaming(self, temp_file_path: str, filename: str, file_size: int, progress_msg) -> str:
+        """Upload file to GitHub with progress and speed using streaming"""
+        uploaded = 0
+        start_time = time.time()
+        last_update_time = start_time
+        last_uploaded = 0
+        
+        async def progress_callback(current: int):
+            nonlocal uploaded, last_update_time, last_uploaded
+            
+            # Check if we should stop
+            if self.should_stop:
+                raise Exception("Upload stopped by admin command")
+            
+            uploaded = current
+            current_time = time.time()
+            progress = (current / file_size) * 100
+            
+            # Calculate speed
+            time_diff = current_time - last_update_time
+            bytes_diff = current - last_uploaded
+            speed = bytes_diff / time_diff if time_diff > 0 else 0
+            
+            # Update every 2% progress or every 2 seconds
+            if progress - getattr(progress_callback, 'last_progress', 0) >= 2 or time_diff >= 2:
+                await progress_msg.edit(
+                    f"📤 **Uploading to GitHub...**\n\n"
+                    f"📁 {filename}\n"
+                    f"📊 {self.format_size(current)} / {self.format_size(file_size)}\n"
+                    f"⏳ {progress:.1f}%\n"
+                    f"🚀 Speed: {self.format_size(speed)}/s\n"
+                    f"{'█' * int(progress // 5)}{'░' * (20 - int(progress // 5))}"
+                )
+                progress_callback.last_progress = progress
+                last_update_time = current_time
+                last_uploaded = current
+        
+        return await self.github_uploader.upload_asset_streaming(temp_file_path, filename, file_size, progress_callback)
+
+    def format_size(self, size: int) -> str:
+        """Format file size in human readable format"""
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size < 1024.0:
+                return f"{size:.1f} {unit}"
+            size /= 1024.0
+        return f"{size:.1f} TB"
+
+    def parse_delete_numbers(self, delete_args: str) -> List[int]:
+        """Parse delete command arguments to extract file numbers"""
+        numbers = []
+        
+        # Split by comma to handle multiple arguments
+        parts = [part.strip() for part in delete_args.split(',')]
+        
+        for part in parts:
+            if '-' in part and part.count('-') == 1:
+                # Handle range (e.g., "1-5")
+                try:
+                    start, end = part.split('-')
+                    start_num = int(start.strip())
+                    end_num = int(end.strip())
+                    
+                    if start_num > end_num:
+                        continue  # Invalid range
+                    
+                    numbers.extend(range(start_num, end_num + 1))
+                except ValueError:
+                    continue  # Invalid range format
+            else:
+                # Handle single number
+                try:
+                    numbers.append(int(part))
+                except ValueError:
+                    continue  # Invalid number
+        
+        return numbers
+
+async def main():
+    bot = TelegramBot()
+    await bot.start()
+
+if __name__ == "__main__":
+    asyncio.run(main())
