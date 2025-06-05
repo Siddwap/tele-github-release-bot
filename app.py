@@ -4,6 +4,7 @@ import logging
 from proxy_service import ProxyService
 from url_manager import URLManager
 from config import BotConfig
+from response_formatter import format_upload_complete_message, get_both_urls
 import os
 
 app = Flask(__name__)
@@ -53,6 +54,56 @@ def proxy_file(filename, proxy_id):
     except Exception as e:
         logger.error(f"Proxy error for {filename}/{proxy_id}: {e}")
         abort(500, "Internal server error")
+
+@app.route('/api/format-response', methods=['POST'])
+def format_response():
+    """API endpoint for bot to get formatted response with both URLs"""
+    try:
+        data = request.get_json()
+        
+        if not data or 'github_url' not in data or 'filename' not in data:
+            return jsonify({"error": "Missing required fields: github_url, filename"}), 400
+        
+        github_url = data['github_url']
+        filename = data['filename']
+        file_size = data.get('file_size', '')
+        
+        # Format the complete response message
+        formatted_message = format_upload_complete_message(github_url, filename, file_size)
+        
+        # Also get both URLs separately
+        url_data = get_both_urls(github_url, filename)
+        
+        return jsonify({
+            "formatted_message": formatted_message,
+            "urls": url_data,
+            "success": True
+        })
+        
+    except Exception as e:
+        logger.error(f"Error formatting response: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+@app.route('/api/get-urls', methods=['POST'])
+def get_urls():
+    """API endpoint to get both original and proxy URLs"""
+    try:
+        data = request.get_json()
+        
+        if not data or 'github_url' not in data or 'filename' not in data:
+            return jsonify({"error": "Missing required fields: github_url, filename"}), 400
+        
+        github_url = data['github_url']
+        filename = data['filename']
+        
+        # Get both URLs
+        url_data = get_both_urls(github_url, filename)
+        
+        return jsonify(url_data)
+        
+    except Exception as e:
+        logger.error(f"Error getting URLs: {e}")
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route('/api/info/<filename>/<proxy_id>')
 def file_info(filename, proxy_id):

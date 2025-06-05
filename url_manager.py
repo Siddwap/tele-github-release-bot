@@ -14,6 +14,9 @@ class URLManager:
             proxy_domain=getattr(config, 'proxy_domain', 'localhost:5000')
         )
         self.proxy_enabled = getattr(config, 'proxy_enabled', True)
+        
+        # Log initialization
+        logger.info(f"URLManager initialized - Proxy enabled: {self.proxy_enabled}, Domain: {self.proxy_service.proxy_domain}")
     
     def process_upload_result(self, github_url: str, filename: str) -> Dict[str, str]:
         """Process GitHub upload result and return both URLs"""
@@ -23,11 +26,15 @@ class URLManager:
             'proxy_enabled': self.proxy_enabled
         }
         
+        logger.info(f"Processing upload result for {filename}")
+        logger.debug(f"Original URL: {github_url}")
+        
         if self.proxy_enabled:
             try:
                 proxy_url = self.proxy_service.encode_url(github_url, filename)
                 result['proxy_url'] = proxy_url
                 result['has_proxy'] = True
+                logger.info(f"Generated proxy URL: {proxy_url}")
             except Exception as e:
                 logger.error(f"Failed to generate proxy URL: {e}")
                 result['proxy_url'] = github_url
@@ -35,6 +42,7 @@ class URLManager:
         else:
             result['proxy_url'] = github_url
             result['has_proxy'] = False
+            logger.info("Proxy disabled, using original URL")
         
         return result
     
@@ -60,7 +68,10 @@ class URLManager:
             message += f"📎 Download URL: {original_url}\n"
             if not url_data.get('proxy_enabled', True):
                 message += f"ℹ️ Proxy service disabled"
+            else:
+                message += f"⚠️ Proxy service not working"
         
+        logger.debug(f"Formatted message: {message}")
         return message
     
     def get_original_url(self, proxy_url: str) -> Optional[str]:
