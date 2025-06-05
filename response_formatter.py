@@ -11,22 +11,27 @@ class ResponseFormatter:
         try:
             self.config = BotConfig.from_env()
             self.url_manager = URLManager(self.config)
+            logger.info("ResponseFormatter initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize ResponseFormatter: {e}")
             self.url_manager = None
     
     def format_upload_response(self, github_url: str, filename: str, file_size: str = "") -> str:
         """Format the upload response with both URLs"""
+        logger.info(f"Formatting upload response for: {filename}")
+        
         if not self.url_manager:
-            # Fallback to simple response if URL manager failed to initialize
+            logger.warning("URL manager not available, using fallback response")
             return f"✅ Upload Complete!\n\n📁 File: {filename}\n📎 Download URL: {github_url}"
         
         try:
             # Process the upload result to get both URLs
             url_data = self.url_manager.process_upload_result(github_url, filename)
+            logger.info(f"URL data generated: {url_data}")
             
             # Format the complete response message
             response = self.url_manager.format_download_message(url_data, file_size)
+            logger.info(f"Formatted response: {response}")
             
             return response
             
@@ -75,8 +80,18 @@ response_formatter = ResponseFormatter()
 
 def format_upload_complete_message(github_url: str, filename: str, file_size: str = "") -> str:
     """Main function to format upload completion message with both URLs"""
+    logger.info(f"format_upload_complete_message called with: {filename}")
     return response_formatter.format_upload_response(github_url, filename, file_size)
 
 def get_both_urls(github_url: str, filename: str) -> Dict[str, str]:
     """Get both original and proxy URLs"""
     return response_formatter.validate_and_get_urls(github_url, filename)
+
+# Legacy function names for backward compatibility
+def format_upload_response(github_url: str, filename: str, file_size: str = "") -> str:
+    """Legacy function name for backward compatibility"""
+    return format_upload_complete_message(github_url, filename, file_size)
+
+def get_proxy_url(github_url: str, filename: str) -> Optional[str]:
+    """Legacy function to get proxy URL"""
+    return response_formatter.get_proxy_url(github_url, filename)
