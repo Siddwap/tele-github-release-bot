@@ -9,13 +9,23 @@ logger = logging.getLogger(__name__)
 
 def is_txt_upload_request(message_text: str) -> bool:
     """
-    Check if the message contains txt upload format.
-    Format: filename : url or filename - url or filename = url
+    Check if the message contains txt upload format with specific command.
+    Must start with /txt_upload or similar command prefix.
     """
     if not message_text or len(message_text.strip()) < 10:
         return False
     
-    lines = message_text.strip().split('\n')
+    # Check for specific command prefixes
+    command_prefixes = ['/txt_upload', '!txt_upload', '#txt_upload', 'txt_upload:', '/txtupload', '!txtupload']
+    
+    first_line = message_text.strip().split('\n')[0].lower()
+    has_command = any(first_line.startswith(prefix.lower()) for prefix in command_prefixes)
+    
+    if not has_command:
+        return False
+    
+    # Now check for valid file entries in the rest of the message
+    lines = message_text.strip().split('\n')[1:]  # Skip the command line
     valid_lines = 0
     
     for line in lines:
@@ -39,17 +49,21 @@ def is_txt_upload_request(message_text: str) -> bool:
                 if filename and url and url.startswith(('http://', 'https://')):
                     valid_lines += 1
     
-    # Consider it a txt upload if at least 2 valid lines or more than 50% of lines are valid
-    total_non_empty_lines = len([l for l in lines if l.strip()])
-    return valid_lines >= 2 or (total_non_empty_lines > 0 and valid_lines / total_non_empty_lines > 0.5)
+    # Consider it a txt upload if at least 1 valid line exists
+    return valid_lines >= 1
 
 def parse_txt_upload_content(message_text: str) -> List[Tuple[str, str]]:
     """
     Parse txt upload content and return list of (filename, url) tuples.
     Preserves Unicode characters including Hindi text in filenames.
+    Skips the command line.
     """
     file_entries = []
     lines = message_text.strip().split('\n')
+    
+    # Skip the first line (command line)
+    if lines:
+        lines = lines[1:]
     
     for line in lines:
         line = line.strip()
@@ -144,3 +158,33 @@ def format_txt_result_message(total_files: int, successful: int, failed: int, re
     message += f"\n📄 **Results file created with all GitHub links!**"
     
     return message
+
+def get_txt_upload_help() -> str:
+    """Get help message for txt upload command"""
+    return (
+        "📝 **Txt Upload Command Help**\n\n"
+        "To upload multiple files from a txt list, use this command format:\n\n"
+        "**Command:** `/txt_upload` (or `!txt_upload`, `#txt_upload`, `txt_upload:`)\n\n"
+        "**Format:**\n"
+        "```\n"
+        "/txt_upload\n"
+        "file_name1 : file_url1\n"
+        "file_name2 : file_url2\n"
+        "file_name3 : file_url3\n"
+        "```\n\n"
+        "**Supported separators:**\n"
+        "• `filename : url`\n"
+        "• `filename - url`\n"
+        "• `filename = url`\n\n"
+        "**Unicode Support:**\n"
+        "• Hindi filenames: `पुस्तक.pdf : https://example.com/book.pdf`\n"
+        "• Any Unicode characters are fully supported\n\n"
+        "**Example:**\n"
+        "```\n"
+        "/txt_upload\n"
+        "video1.mp4 : https://example.com/video1.mp4\n"
+        "गणित_पुस्तक.pdf : https://example.com/math_book.pdf\n"
+        "image.jpg : https://example.com/image.jpg\n"
+        "```\n\n"
+        "The bot will download all files, upload them to GitHub with preserved Unicode filenames, and send you back a txt file with the GitHub URLs!"
+    )

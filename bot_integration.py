@@ -46,13 +46,13 @@ async def handle_bot_message(github_uploader, message_text: str) -> str:
     This is the main function bots should use for message handling.
     """
     try:
-        # Check if it's a txt upload request
+        # Check if it's a txt upload request (requires command)
         if is_txt_upload_message(message_text):
-            logger.info("Detected txt upload message, processing...")
+            logger.info("Detected txt upload command, processing...")
             return await handle_txt_upload_message(github_uploader, message_text)
         
-        # If not txt upload, return help or normal processing
-        if "txt upload help" in message_text.lower() or "txt help" in message_text.lower():
+        # Check for help commands
+        if any(cmd in message_text.lower() for cmd in ['/txt_help', '!txt_help', '#txt_help', 'txt_help']):
             return get_txt_help()
         
         # Return None to indicate normal processing should continue
@@ -64,7 +64,7 @@ async def handle_bot_message(github_uploader, message_text: str) -> str:
 
 def check_txt_upload_format(message_text: str) -> bool:
     """
-    Check if message is in txt upload format.
+    Check if message is in txt upload format (requires command).
     Use this before processing messages normally.
     """
     return is_txt_upload_message(message_text)
