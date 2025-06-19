@@ -19,7 +19,12 @@ class BulkUploader:
         try:
             logger.info(f"Downloading {filename} from {url}")
             
-            async with session.get(url) as response:
+            # Set headers to handle various file types
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            
+            async with session.get(url, headers=headers) as response:
                 if response.status != 200:
                     logger.error(f"Failed to download {filename}: HTTP {response.status}")
                     return None
@@ -41,14 +46,18 @@ class BulkUploader:
     def upload_to_github(self, filename: str, content: bytes) -> Optional[str]:
         """Upload content to GitHub and return URL"""
         try:
-            # Create temporary file
+            # Create temporary file with proper encoding for Unicode filenames
             import tempfile
-            with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{filename}") as temp_file:
+            
+            # Create a safe temporary filename but preserve original for GitHub upload
+            temp_filename = f"temp_{hash(filename)}_{filename}"
+            
+            with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{temp_filename}") as temp_file:
                 temp_file.write(content)
                 temp_file_path = temp_file.name
             
             try:
-                # Upload to GitHub
+                # Upload to GitHub with original Unicode filename
                 github_url = self.github_uploader.upload_file(temp_file_path, filename)
                 logger.info(f"Successfully uploaded {filename} to GitHub: {github_url}")
                 return github_url
@@ -67,15 +76,19 @@ class BulkUploader:
         """Process bulk upload of files from URLs"""
         results = []
         
-        # Create aiohttp session
+        # Create aiohttp session with proper timeout and encoding
         timeout = aiohttp.ClientTimeout(total=300)  # 5 minute timeout
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        connector = aiohttp.TCPConnector(limit=10)
+        
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
             # Process files in batches to avoid overwhelming the system
             semaphore = asyncio.Semaphore(self.max_concurrent_downloads)
             
             async def process_single_file(file_name: str, file_url: str) -> Tuple[str, str, str]:
                 async with semaphore:
                     try:
+                        logger.info(f"Processing file: {file_name}")
+                        
                         # Download file
                         content = await self.download_file(session, file_url, file_name)
                         
@@ -83,8 +96,9 @@ class BulkUploader:
                             logger.error(f"Failed to download {file_name}")
                             return (file_name, file_url, "")
                         
-                        # Upload to GitHub (this is synchronous)
-                        github_url = await asyncio.get_event_loop().run_in_executor(
+                        # Upload to GitHub (run in thread pool to avoid blocking)
+                        loop = asyncio.get_event_loop()
+                        github_url = await loop.run_in_executor(
                             None, self.upload_to_github, file_name, content
                         )
                         

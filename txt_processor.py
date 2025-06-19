@@ -1,132 +1,146 @@
 
-import logging
 import re
-from typing import Dict, List, Tuple, Optional
-import tempfile
+import logging
+from typing import List, Tuple, Optional
 import os
+import tempfile
 
 logger = logging.getLogger(__name__)
 
-class TxtFileProcessor:
-    def __init__(self):
-        self.supported_formats = [
-            r'^(.+?)\s*:\s*(.+)$',  # file_name : file_url
-            r'^(.+?)\s*-\s*(.+)$',  # file_name - file_url
-            r'^(.+?)\s*=\s*(.+)$',  # file_name = file_url
-        ]
+def is_txt_upload_request(message_text: str) -> bool:
+    """
+    Check if the message contains txt upload format.
+    Format: filename : url or filename - url or filename = url
+    """
+    if not message_text or len(message_text.strip()) < 10:
+        return False
     
-    def is_txt_upload_format(self, content: str) -> bool:
-        """Check if the content is in the expected txt upload format"""
-        lines = content.strip().split('\n')
-        if len(lines) < 1:
-            return False
-        
-        valid_lines = 0
-        for line in lines:
-            line = line.strip()
-            if not line:  # Skip empty lines
-                continue
+    lines = message_text.strip().split('\n')
+    valid_lines = 0
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
             
-            # Check if line matches any supported format
-            for pattern in self.supported_formats:
-                if re.match(pattern, line):
+        # Check for various separators
+        if ' : ' in line or ' - ' in line or ' = ' in line:
+            parts = None
+            if ' : ' in line:
+                parts = line.split(' : ', 1)
+            elif ' - ' in line:
+                parts = line.split(' - ', 1)
+            elif ' = ' in line:
+                parts = line.split(' = ', 1)
+            
+            if parts and len(parts) == 2:
+                filename = parts[0].strip()
+                url = parts[1].strip()
+                if filename and url and url.startswith(('http://', 'https://')):
                     valid_lines += 1
-                    break
-        
-        # Consider it a txt upload format if at least 50% of non-empty lines match
-        non_empty_lines = len([l for l in lines if l.strip()])
-        return valid_lines >= max(1, non_empty_lines * 0.5)
     
-    def parse_txt_content(self, content: str) -> List[Tuple[str, str]]:
-        """Parse txt content and extract file_name : file_url pairs"""
-        results = []
-        lines = content.strip().split('\n')
-        
-        for line_num, line in enumerate(lines, 1):
-            line = line.strip()
-            if not line:  # Skip empty lines
-                continue
-            
-            parsed = False
-            for pattern in self.supported_formats:
-                match = re.match(pattern, line)
-                if match:
-                    file_name = match.group(1).strip()
-                    file_url = match.group(2).strip()
-                    
-                    if file_name and file_url:
-                        results.append((file_name, file_url))
-                        logger.info(f"Parsed line {line_num}: {file_name} -> {file_url}")
-                        parsed = True
-                        break
-            
-            if not parsed:
-                logger.warning(f"Could not parse line {line_num}: {line}")
-        
-        logger.info(f"Successfully parsed {len(results)} file entries")
-        return results
+    # Consider it a txt upload if at least 2 valid lines or more than 50% of lines are valid
+    total_non_empty_lines = len([l for l in lines if l.strip()])
+    return valid_lines >= 2 or (total_non_empty_lines > 0 and valid_lines / total_non_empty_lines > 0.5)
+
+def parse_txt_upload_content(message_text: str) -> List[Tuple[str, str]]:
+    """
+    Parse txt upload content and return list of (filename, url) tuples.
+    Preserves Unicode characters including Hindi text in filenames.
+    """
+    file_entries = []
+    lines = message_text.strip().split('\n')
     
-    def create_result_txt(self, results: List[Tuple[str, str, str]]) -> str:
-        """Create result txt content with file_name : github_url format"""
-        lines = []
-        for file_name, original_url, github_url in results:
-            lines.append(f"{file_name} : {github_url}")
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
         
-        content = '\n'.join(lines)
-        logger.info(f"Created result txt with {len(results)} entries")
-        return content
-    
-    def create_temp_txt_file(self, content: str, filename: str = "github_links.txt") -> str:
-        """Create a temporary txt file with the given content"""
-        try:
-            temp_dir = tempfile.mkdtemp()
-            temp_file_path = os.path.join(temp_dir, filename)
+        # Try different separators
+        parts = None
+        if ' : ' in line:
+            parts = line.split(' : ', 1)
+        elif ' - ' in line:
+            parts = line.split(' - ', 1)
+        elif ' = ' in line:
+            parts = line.split(' = ', 1)
+        
+        if parts and len(parts) == 2:
+            filename = parts[0].strip()
+            url = parts[1].strip()
             
-            with open(temp_file_path, 'w', encoding='utf-8') as f:
-                f.write(content)
-            
-            logger.info(f"Created temporary txt file: {temp_file_path}")
-            return temp_file_path
-        except Exception as e:
-            logger.error(f"Error creating temporary txt file: {e}")
-            raise
+            # Validate URL
+            if url.startswith(('http://', 'https://')) and filename:
+                # Preserve Unicode characters in filename (including Hindi)
+                # Only sanitize dangerous characters but keep Unicode
+                safe_filename = sanitize_filename_preserve_unicode(filename)
+                file_entries.append((safe_filename, url))
+                logger.info(f"Parsed entry: {safe_filename} -> {url}")
     
-    def format_txt_processing_message(self, 
-                                    original_count: int, 
-                                    successful_count: int, 
-                                    failed_count: int,
-                                    result_file_url: str) -> str:
-        """Format the message for txt file processing results"""
-        message = f"📝 Txt File Processing Complete!\n\n"
-        message += f"📊 Processing Summary:\n"
-        message += f"   • Total files found: {original_count}\n"
-        message += f"   • Successfully uploaded: {successful_count}\n"
+    logger.info(f"Parsed {len(file_entries)} file entries from txt content")
+    return file_entries
+
+def sanitize_filename_preserve_unicode(filename: str) -> str:
+    """
+    Sanitize filename while preserving Unicode characters (including Hindi).
+    Only removes/replaces characters that are dangerous for file systems.
+    """
+    # Characters that are problematic for file systems
+    dangerous_chars = r'[<>:"/\\|?*\x00-\x1f]'
+    
+    # Replace dangerous characters with underscore
+    safe_filename = re.sub(dangerous_chars, '_', filename)
+    
+    # Remove leading/trailing spaces and dots
+    safe_filename = safe_filename.strip(' .')
+    
+    # Ensure filename is not empty
+    if not safe_filename:
+        safe_filename = "unnamed_file"
+    
+    # Limit length to prevent filesystem issues
+    if len(safe_filename) > 200:
+        name, ext = os.path.splitext(safe_filename)
+        safe_filename = name[:190] + ext
+    
+    return safe_filename
+
+def create_txt_result_file(successful_results: List[Tuple[str, str, str]], output_filename: str = "github_links.txt") -> str:
+    """
+    Create a txt file with the results in format: filename : github_url
+    Returns the path to the created file.
+    """
+    try:
+        # Create temporary file
+        temp_dir = tempfile.gettempdir()
+        output_path = os.path.join(temp_dir, output_filename)
         
-        if failed_count > 0:
-            message += f"   • Failed uploads: {failed_count}\n"
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write("# GitHub Upload Results\n")
+            f.write("# Format: filename : github_url\n\n")
+            
+            for filename, original_url, github_url in successful_results:
+                f.write(f"{filename} : {github_url}\n")
         
-        message += f"\n📎 Result File:\n"
-        message += f"🔗 Download your updated links: {result_file_url}\n"
-        message += f"\n💡 The result file contains all GitHub URLs in the same format as your input."
+        logger.info(f"Created result file: {output_path}")
+        return output_path
         
-        return message
+    except Exception as e:
+        logger.error(f"Error creating result file: {e}")
+        raise
 
-# Global instance
-txt_processor = TxtFileProcessor()
-
-def is_txt_upload_request(content: str) -> bool:
-    """Check if content is a txt upload request"""
-    return txt_processor.is_txt_upload_format(content)
-
-def parse_txt_upload_content(content: str) -> List[Tuple[str, str]]:
-    """Parse txt upload content"""
-    return txt_processor.parse_txt_content(content)
-
-def create_txt_result_file(results: List[Tuple[str, str, str]], filename: str = "github_links.txt") -> str:
-    """Create result txt file and return path"""
-    content = txt_processor.create_result_txt(results)
-    return txt_processor.create_temp_txt_file(content, filename)
-
-def format_txt_result_message(original_count: int, successful_count: int, failed_count: int, result_file_url: str) -> str:
-    """Format txt processing result message"""
-    return txt_processor.format_txt_processing_message(original_count, successful_count, failed_count, result_file_url)
+def format_txt_result_message(total_files: int, successful: int, failed: int, result_github_url: str) -> str:
+    """
+    Format the final result message for txt upload.
+    """
+    message = f"🎉 **Txt Upload Complete!**\n\n"
+    message += f"📊 **Summary:**\n"
+    message += f"• Total files processed: {total_files}\n"
+    message += f"• Successfully uploaded: {successful}\n"
+    
+    if failed > 0:
+        message += f"• Failed uploads: {failed}\n"
+    
+    message += f"\n📄 **Results file created with all GitHub links!**"
+    
+    return message

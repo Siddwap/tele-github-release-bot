@@ -35,13 +35,14 @@ class TxtBotIntegration:
                        "Please use the format:\n"
                        "file_name1 : file_url1\n"
                        "file_name2 : file_url2\n"
-                       "etc.")
+                       "etc.\n\n"
+                       "Supported separators: ' : ', ' - ', ' = '\n"
+                       "Unicode filenames (including Hindi) are fully supported!")
             
             logger.info(f"Found {len(file_entries)} file entries to process")
             
-            # Show processing message
-            processing_msg = (f"🔄 Processing {len(file_entries)} files from your txt input...\n"
-                            f"⏳ This may take a few minutes depending on file sizes.")
+            # Show processing message info
+            logger.info(f"🔄 Processing {len(file_entries)} files from your txt input...")
             
             # Process bulk upload
             results = await process_txt_bulk_upload(self.github_uploader, file_entries)
@@ -52,9 +53,10 @@ class TxtBotIntegration:
             
             if not successful_results:
                 return ("❌ All file uploads failed.\n\n"
-                       "Please check that your URLs are accessible and files are not too large (100MB limit).")
+                       "Please check that your URLs are accessible and files are not too large (100MB limit).\n"
+                       "Make sure the URLs are direct download links.")
             
-            # Create result txt file
+            # Create result txt file with Unicode support
             result_file_path = create_txt_result_file(successful_results, "github_links.txt")
             
             # Upload result file to GitHub
@@ -88,17 +90,20 @@ class TxtBotIntegration:
             "file_name2 : file_url2\n"
             "file_name3 : file_url3\n"
             "```\n\n"
-            "**Supported formats:**\n"
+            "**Supported separators:**\n"
             "• `filename : url`\n"
             "• `filename - url`\n"
             "• `filename = url`\n\n"
+            "**Unicode Support:**\n"
+            "• Hindi filenames: `पुस्तक.pdf : https://example.com/book.pdf`\n"
+            "• Any Unicode characters are fully supported\n\n"
             "**Example:**\n"
             "```\n"
             "video1.mp4 : https://example.com/video1.mp4\n"
-            "document.pdf : https://example.com/doc.pdf\n"
+            "गणित_पुस्तक.pdf : https://example.com/math_book.pdf\n"
             "image.jpg : https://example.com/image.jpg\n"
             "```\n\n"
-            "The bot will download all files, upload them to GitHub, and send you back a txt file with the GitHub URLs!"
+            "The bot will download all files, upload them to GitHub with preserved Unicode filenames, and send you back a txt file with the GitHub URLs!"
         )
 
 # Global instance function
