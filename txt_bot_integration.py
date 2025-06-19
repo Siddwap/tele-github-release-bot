@@ -21,49 +21,65 @@ class TxtBotIntegration:
     
     def should_process_as_txt_upload(self, message_text: str) -> bool:
         """Check if the message should be processed as txt upload (requires command)"""
-        return is_txt_upload_request(message_text)
+        result = is_txt_upload_request(message_text)
+        logger.info(f"Should process as txt upload: {result}")
+        return result
     
     async def process_txt_upload_message(self, message_text: str) -> str:
         """Process a txt upload message and return response"""
         try:
-            logger.info("Processing txt upload message with command")
+            logger.info("Starting txt upload message processing")
             
             # Parse the txt content
             file_entries = parse_txt_upload_content(message_text)
             
             if not file_entries:
-                return ("❌ No valid file entries found in your message.\n\n"
-                       "Please use the correct format:\n"
-                       "```\n"
-                       "/txt_upload\n"
-                       "file_name1 : file_url1\n"
-                       "file_name2 : file_url2\n"
-                       "```\n\n"
-                       "Supported separators: ' : ', ' - ', ' = '\n"
-                       "Unicode filenames (including Hindi) are fully supported!\n\n"
-                       f"Use `/txt_help` for detailed instructions.")
+                logger.warning("No valid file entries found")
+                return (
+                    "❌ **No valid file entries found!**\n\n"
+                    "**Make sure to use this format:**\n"
+                    "```\n"
+                    "/txt_upload\n"
+                    "filename1.mp4 : https://example.com/video1.mp4\n"
+                    "filename2.pdf : https://example.com/document.pdf\n"
+                    "```\n\n"
+                    "**Required:**\n"
+                    "• Start with `/txt_upload` command\n"
+                    "• Use format: `filename : url`\n"
+                    "• URLs must start with http:// or https://\n\n"
+                    "Use `/txt_help` for detailed instructions!"
+                )
             
             logger.info(f"Found {len(file_entries)} file entries to process")
             
-            # Show processing message info
-            logger.info(f"🔄 Processing {len(file_entries)} files from your txt input...")
-            
             # Process bulk upload
+            logger.info("Starting bulk upload process...")
             results = await process_txt_bulk_upload(self.github_uploader, file_entries)
+            logger.info(f"Bulk upload completed with {len(results)} results")
             
             # Count results
             successful_results = [(name, orig, github) for name, orig, github in results if github]
             failed_count = len(results) - len(successful_results)
             
+            logger.info(f"Upload summary: {len(successful_results)} successful, {failed_count} failed")
+            
             if not successful_results:
-                return ("❌ All file uploads failed.\n\n"
-                       "Please check that your URLs are accessible and files are not too large (100MB limit).\n"
-                       "Make sure the URLs are direct download links.")
+                return (
+                    "❌ **All file uploads failed!**\n\n"
+                    "**Possible reasons:**\n"
+                    "• URLs are not accessible\n"
+                    "• Files are too large (100MB limit)\n"
+                    "• URLs are not direct download links\n"
+                    "• Network connectivity issues\n\n"
+                    "Please check your URLs and try again."
+                )
             
             # Create result txt file with Unicode support
+            logger.info("Creating result txt file...")
             result_file_path = create_txt_result_file(successful_results, "github_links.txt")
             
             # Upload result file to GitHub
+            logger.info("Uploading result file to GitHub...")
             result_github_url = self.github_uploader.upload_file(result_file_path, "github_links.txt")
             
             # Get formatted response with proxy URL if available
@@ -77,13 +93,19 @@ class TxtBotIntegration:
                 result_github_url
             )
             
+            logger.info("Txt upload processing completed successfully")
             return f"{summary_msg}\n\n{result_response}"
             
         except Exception as e:
-            logger.error(f"Error processing txt upload: {e}")
-            return (f"❌ Error processing your txt upload: {str(e)}\n\n"
-                   f"Please check your file format and try again.\n"
-                   f"Use `/txt_help` for detailed instructions.")
+            logger.error(f"Error processing txt upload: {e}", exc_info=True)
+            return (
+                f"❌ **Error processing txt upload:** {str(e)}\n\n"
+                f"**Please check:**\n"
+                f"• Your message format is correct\n"
+                f"• URLs are accessible\n"
+                f"• Files are not too large\n\n"
+                f"Use `/txt_help` for detailed instructions."
+            )
     
     def get_txt_upload_help(self) -> str:
         """Get help message for txt upload format"""
@@ -97,16 +119,24 @@ def create_txt_bot_integration(github_uploader: GitHubUploader) -> TxtBotIntegra
 # Easy-to-use functions for bot integration
 async def handle_txt_upload_message(github_uploader: GitHubUploader, message_text: str) -> Optional[str]:
     """Handle txt upload message - returns response if it's a txt upload, None otherwise"""
-    integration = TxtBotIntegration(github_uploader)
-    
-    if integration.should_process_as_txt_upload(message_text):
-        return await integration.process_txt_upload_message(message_text)
-    
-    return None
+    try:
+        integration = TxtBotIntegration(github_uploader)
+        
+        if integration.should_process_as_txt_upload(message_text):
+            logger.info("Processing message as txt upload")
+            return await integration.process_txt_upload_message(message_text)
+        
+        logger.info("Message is not a txt upload request")
+        return None
+    except Exception as e:
+        logger.error(f"Error in handle_txt_upload_message: {e}", exc_info=True)
+        return f"❌ Error handling txt upload: {str(e)}"
 
 def is_txt_upload_message(message_text: str) -> bool:
     """Check if message is a txt upload request (requires command)"""
-    return is_txt_upload_request(message_text)
+    result = is_txt_upload_request(message_text)
+    logger.info(f"Is txt upload message: {result}")
+    return result
 
 def get_txt_help() -> str:
     """Get txt upload help message"""

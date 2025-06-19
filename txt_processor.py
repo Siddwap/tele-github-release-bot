@@ -15,20 +15,30 @@ def is_txt_upload_request(message_text: str) -> bool:
     if not message_text or len(message_text.strip()) < 10:
         return False
     
-    # Check for specific command prefixes
-    command_prefixes = ['/txt_upload', '!txt_upload', '#txt_upload', 'txt_upload:', '/txtupload', '!txtupload']
+    # Check for specific command prefixes - be more strict
+    command_prefixes = ['/txt_upload', '!txt_upload', '#txt_upload', '/txtupload', '!txtupload']
     
-    first_line = message_text.strip().split('\n')[0].lower()
+    # Get the first line and check if it starts with any command
+    lines = message_text.strip().split('\n')
+    if not lines:
+        return False
+        
+    first_line = lines[0].strip().lower()
+    
+    # Must start with one of the command prefixes
     has_command = any(first_line.startswith(prefix.lower()) for prefix in command_prefixes)
     
     if not has_command:
+        logger.info(f"No txt upload command found in first line: {first_line}")
         return False
     
-    # Now check for valid file entries in the rest of the message
-    lines = message_text.strip().split('\n')[1:]  # Skip the command line
-    valid_lines = 0
+    logger.info(f"Found txt upload command: {first_line}")
     
-    for line in lines:
+    # Now check for valid file entries in the rest of the message
+    content_lines = lines[1:]  # Skip the command line
+    valid_entries = 0
+    
+    for line in content_lines:
         line = line.strip()
         if not line:
             continue
@@ -47,10 +57,11 @@ def is_txt_upload_request(message_text: str) -> bool:
                 filename = parts[0].strip()
                 url = parts[1].strip()
                 if filename and url and url.startswith(('http://', 'https://')):
-                    valid_lines += 1
+                    valid_entries += 1
+                    logger.info(f"Found valid entry: {filename} -> {url}")
     
-    # Consider it a txt upload if at least 1 valid line exists
-    return valid_lines >= 1
+    logger.info(f"Found {valid_entries} valid entries")
+    return valid_entries >= 1
 
 def parse_txt_upload_content(message_text: str) -> List[Tuple[str, str]]:
     """
@@ -86,7 +97,6 @@ def parse_txt_upload_content(message_text: str) -> List[Tuple[str, str]]:
             # Validate URL
             if url.startswith(('http://', 'https://')) and filename:
                 # Preserve Unicode characters in filename (including Hindi)
-                # Only sanitize dangerous characters but keep Unicode
                 safe_filename = sanitize_filename_preserve_unicode(filename)
                 file_entries.append((safe_filename, url))
                 logger.info(f"Parsed entry: {safe_filename} -> {url}")
@@ -113,9 +123,10 @@ def sanitize_filename_preserve_unicode(filename: str) -> str:
         safe_filename = "unnamed_file"
     
     # Limit length to prevent filesystem issues
-    if len(safe_filename) > 200:
-        name, ext = os.path.splitext(safe_filename)
-        safe_filename = name[:190] + ext
+    if len(safe_filename.encode('utf-8')) > 200:
+        # Truncate while preserving Unicode characters
+        while len(safe_filename.encode('utf-8')) > 200 and safe_filename:
+            safe_filename = safe_filename[:-1]
     
     return safe_filename
 
@@ -162,29 +173,40 @@ def format_txt_result_message(total_files: int, successful: int, failed: int, re
 def get_txt_upload_help() -> str:
     """Get help message for txt upload command"""
     return (
-        "📝 **Txt Upload Command Help**\n\n"
-        "To upload multiple files from a txt list, use this command format:\n\n"
-        "**Command:** `/txt_upload` (or `!txt_upload`, `#txt_upload`, `txt_upload:`)\n\n"
-        "**Format:**\n"
+        "📝 **TXT UPLOAD FEATURE - How to Use**\n\n"
+        "⚠️ **IMPORTANT:** You MUST use a command to activate this feature!\n\n"
+        "**Step 1:** Start your message with one of these commands:\n"
+        "• `/txt_upload`\n"
+        "• `!txt_upload`\n"
+        "• `#txt_upload`\n"
+        "• `/txtupload`\n"
+        "• `!txtupload`\n\n"
+        "**Step 2:** On new lines, list your files in this format:\n"
         "```\n"
         "/txt_upload\n"
-        "file_name1 : file_url1\n"
-        "file_name2 : file_url2\n"
-        "file_name3 : file_url3\n"
+        "filename1.mp4 : https://example.com/video1.mp4\n"
+        "filename2.pdf : https://example.com/document.pdf\n"
+        "हिंदी_फाइल.jpg : https://example.com/hindi_image.jpg\n"
         "```\n\n"
         "**Supported separators:**\n"
-        "• `filename : url`\n"
+        "• `filename : url` (recommended)\n"
         "• `filename - url`\n"
         "• `filename = url`\n\n"
-        "**Unicode Support:**\n"
-        "• Hindi filenames: `पुस्तक.pdf : https://example.com/book.pdf`\n"
-        "• Any Unicode characters are fully supported\n\n"
-        "**Example:**\n"
+        "**✅ Features:**\n"
+        "• Supports Hindi/Unicode filenames perfectly\n"
+        "• Bulk upload multiple files at once\n"
+        "• Returns a txt file with all GitHub URLs\n"
+        "• Preserves original filenames\n\n"
+        "**❌ What NOT to do:**\n"
+        "• Don't send just URLs without the command\n"
+        "• Don't mix this with regular file uploads\n"
+        "• Don't forget the command at the start\n\n"
+        "**Example that works:**\n"
         "```\n"
         "/txt_upload\n"
-        "video1.mp4 : https://example.com/video1.mp4\n"
-        "गणित_पुस्तक.pdf : https://example.com/math_book.pdf\n"
-        "image.jpg : https://example.com/image.jpg\n"
+        "movie.mp4 : https://drive.google.com/file/d/123/view\n"
+        "गीत.mp3 : https://example.com/hindi_song.mp3\n"
+        "document.pdf : https://dropbox.com/file.pdf\n"
         "```\n\n"
-        "The bot will download all files, upload them to GitHub with preserved Unicode filenames, and send you back a txt file with the GitHub URLs!"
+        "The bot will download all files, upload to GitHub with preserved names, and give you back a txt file with GitHub URLs!"
     )

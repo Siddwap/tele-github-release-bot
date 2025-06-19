@@ -44,30 +44,43 @@ async def handle_bot_message(github_uploader, message_text: str) -> str:
     """
     Handle bot message - checks for txt upload format and processes accordingly.
     This is the main function bots should use for message handling.
+    
+    Returns:
+    - String response if message was handled (txt upload or help)
+    - None if message should be processed normally
     """
     try:
+        logger.info(f"Checking message for txt upload: {message_text[:100]}...")
+        
+        # Check for help commands first
+        help_commands = ['/txt_help', '!txt_help', '#txt_help', 'txt_help', '/txthelp', '!txthelp']
+        if any(cmd.lower() in message_text.lower() for cmd in help_commands):
+            logger.info("Returning txt help message")
+            return get_txt_help()
+        
         # Check if it's a txt upload request (requires command)
         if is_txt_upload_message(message_text):
             logger.info("Detected txt upload command, processing...")
-            return await handle_txt_upload_message(github_uploader, message_text)
-        
-        # Check for help commands
-        if any(cmd in message_text.lower() for cmd in ['/txt_help', '!txt_help', '#txt_help', 'txt_help']):
-            return get_txt_help()
+            response = await handle_txt_upload_message(github_uploader, message_text)
+            logger.info("Txt upload processing completed")
+            return response
         
         # Return None to indicate normal processing should continue
+        logger.info("Message is not a txt upload request, continuing normal processing")
         return None
         
     except Exception as e:
-        logger.error(f"Error in bot message handling: {e}")
-        return f"❌ Error processing your message: {str(e)}"
+        logger.error(f"Error in bot message handling: {e}", exc_info=True)
+        return f"❌ Error processing your message: {str(e)}\n\nUse `/txt_help` for instructions on txt upload feature."
 
 def check_txt_upload_format(message_text: str) -> bool:
     """
     Check if message is in txt upload format (requires command).
     Use this before processing messages normally.
     """
-    return is_txt_upload_message(message_text)
+    result = is_txt_upload_message(message_text)
+    logger.info(f"Txt upload format check result: {result}")
+    return result
 
 def get_txt_upload_help_message() -> str:
     """
