@@ -16,6 +16,11 @@ class BotConfig:
     max_file_size: int = 4 * 1024 * 1024 * 1024  # 4GB
     progress_update_interval: int = 5  # Update every 5%
     
+    # Proxy service configuration
+    proxy_enabled: bool = True
+    proxy_domain: str = "localhost:5000"
+    proxy_secret_key: str = "telegram_bot_proxy_secret"
+    
     @classmethod
     def from_env(cls) -> 'BotConfig':
         """Create config from environment variables"""
@@ -37,6 +42,9 @@ class BotConfig:
             github_release_tag=os.getenv('GITHUB_RELEASE_TAG', ''),
             admin_user_ids=admin_user_ids,
             log_level=os.getenv('LOG_LEVEL', 'INFO'),
+            proxy_enabled=os.getenv('PROXY_ENABLED', 'true').lower() == 'true',
+            proxy_domain=os.getenv('PROXY_DOMAIN', 'localhost:5000'),
+            proxy_secret_key=os.getenv('PROXY_SECRET_KEY', 'telegram_bot_proxy_secret'),
         )
     
     def validate(self) -> None:
