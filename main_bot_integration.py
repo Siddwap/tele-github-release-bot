@@ -1,7 +1,6 @@
 
 import logging
-from telegram import Update
-from telegram.ext import ContextTypes
+from telethon import events
 from bot_txt_handler import BotTxtHandler
 from config import BotConfig
 
@@ -12,15 +11,15 @@ class MainBotIntegration:
         self.config = config
         self.txt_handler = BotTxtHandler(config)
     
-    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    async def handle_message(self, event) -> bool:
         """Main message handler - returns True if message was handled"""
         try:
             # Handle txt help command
-            if await self.txt_handler.handle_txt_help(update, context):
+            if await self.txt_handler.handle_txt_help(event):
                 return True
             
             # Handle txt file uploads
-            if await self.txt_handler.handle_txt_file(update, context):
+            if await self.txt_handler.handle_txt_file(event):
                 return True
             
             # Message not handled by our integration

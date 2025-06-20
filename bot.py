@@ -1,7 +1,8 @@
+
 import logging
 import os
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telethon import TelegramClient, events
+from telethon.tl.types import DocumentAttributeFilename
 from config import BotConfig
 from main_bot_integration import initialize_bot_integration, bot_integration
 from m3u8_downloader import M3U8Downloader
@@ -15,30 +16,44 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Initialize config
-config = BotConfig()
-
-# Initialize bot integration
-initialize_bot_integration(config)
-
-# Initialize GitHub uploader
-github_uploader = GitHubUploader(
-    token=config.github_token,
-    repo=config.github_repo,
-    release_tag=config.github_release_tag
-)
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send a message when the command /start is issued."""
-    await update.message.reply_text(
-        "🎉 Welcome to File Uploader Bot!\n\n"
-        "I can help you upload files to GitHub and download M3U8 streams.\n\n"
-        "Use /help to see all available commands."
-    )
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send a message when the command /help is issued."""
-    help_text = """
+class TelegramBot:
+    def __init__(self):
+        # Initialize config
+        self.config = BotConfig.from_env()
+        
+        # Initialize bot integration
+        initialize_bot_integration(self.config)
+        
+        # Initialize GitHub uploader
+        self.github_uploader = GitHubUploader(
+            token=self.config.github_token,
+            repo=self.config.github_repo,
+            release_tag=self.config.github_release_tag
+        )
+        
+        # Initialize Telethon client
+        self.client = TelegramClient(
+            'bot_session',
+            self.config.telegram_api_id,
+            self.config.telegram_api_hash
+        )
+        
+        # Register event handlers
+        self.client.add_event_handler(self.handle_start, events.NewMessage(pattern='/start'))
+        self.client.add_event_handler(self.handle_help, events.NewMessage(pattern='/help'))
+        self.client.add_event_handler(self.handle_message, events.NewMessage())
+    
+    async def handle_start(self, event):
+        """Handle /start command"""
+        await event.respond(
+            "🎉 Welcome to File Uploader Bot!\n\n"
+            "I can help you upload files to GitHub and download M3U8 streams.\n\n"
+            "Use /help to see all available commands."
+        )
+    
+    async def handle_help(self, event):
+        """Handle /help command"""
+        help_text = """
 🤖 **File Uploader Bot Help**
 
 **Basic Commands:**
@@ -72,106 +87,114 @@ playlist.m3u8 : https://example.com/stream.m3u8
 ```
 
 Need help? Just send me a file or M3U8 link to get started!
-    """
-    await update.message.reply_text(help_text, parse_mode='Markdown')
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle all messages"""
-    try:
-        # Check if our integration handles this message FIRST
-        if bot_integration and await bot_integration.handle_message(update, context):
-            return  # Message was handled, don't process further
-        
-        # Handle M3U8 URL
-        if update.message.text and update.message.text.strip().startswith('http'):
-            m3u8_url = update.message.text.strip()
-            status_message = await update.message.reply_text("Downloading M3U8 stream...")
+        """
+        await event.respond(help_text)
+    
+    async def handle_message(self, event):
+        """Handle all messages"""
+        try:
+            # Check if our integration handles this message FIRST
+            if bot_integration and await bot_integration.handle_message(event):
+                return  # Message was handled, don't process further
             
-            async def progress_callback(message):
+            # Handle M3U8 URL
+            if event.message.text and event.message.text.strip().startswith('http'):
+                m3u8_url = event.message.text.strip()
+                status_message = await event.respond("Downloading M3U8 stream...")
+                
+                async def progress_callback(message):
+                    try:
+                        await status_message.edit(message)
+                    except:
+                        pass  # Ignore edit errors
+                
                 try:
-                    await status_message.edit_text(message)
-                except:
-                    pass  # Ignore edit errors
+                    downloader = M3U8Downloader()
+                    file_path = await downloader.download_m3u8(m3u8_url, progress_callback=progress_callback)
+                    
+                    await status_message.edit("Uploading to GitHub...")
+                    github_url = await self.github_uploader.upload_file(file_path)
+                    await status_message.edit(f"✅ Uploaded to GitHub!\n\n🔗 Download Link: {github_url}")
+                    
+                    os.remove(file_path)  # Clean up temp file
+                except Exception as e:
+                    logger.error(f"Error downloading M3U8: {e}")
+                    await status_message.edit(f"❌ Error downloading M3U8: {str(e)}")
+                return
             
-            try:
-                downloader = M3U8Downloader()
-                file_path = await downloader.download_m3u8(m3u8_url, progress_callback=progress_callback)
+            # Handle M3U8 file upload
+            if event.message.document and event.message.document.mime_type == 'application/x-mpegURL':
+                file_id = event.message.document.id
+                file_path = await event.message.download_media()
                 
-                await status_message.edit_text("Uploading to GitHub...")
-                github_url = await github_uploader.upload_file(file_path)
-                await status_message.edit_text(f"✅ Uploaded to GitHub!\n\n🔗 Download Link: {github_url}")
+                status_message = await event.respond("Downloading M3U8 stream...")
                 
-                os.remove(file_path)  # Clean up temp file
-            except Exception as e:
-                logger.error(f"Error downloading M3U8: {e}")
-                await status_message.edit_text(f"❌ Error downloading M3U8: {str(e)}")
-            return
-        
-        # Handle M3U8 file upload
-        if update.message.document and update.message.document.file_name.endswith('.m3u8'):
-            file_id = update.message.document.file_id
-            file = await context.bot.get_file(file_id)
-            file_path = await file.download_as_bytearray()
-            
-            status_message = await update.message.reply_text("Downloading M3U8 stream...")
-            
-            async def progress_callback(message):
+                async def progress_callback(message):
+                    try:
+                        await status_message.edit(message)
+                    except:
+                        pass  # Ignore edit errors
+                
                 try:
-                    await status_message.edit_text(message)
-                except:
-                    pass  # Ignore edit errors
+                    downloader = M3U8Downloader()
+                    temp_file_path = await downloader.download_m3u8_from_file(file_path, progress_callback=progress_callback)
+                    
+                    await status_message.edit("Uploading to GitHub...")
+                    github_url = await self.github_uploader.upload_file(temp_file_path)
+                    await status_message.edit(f"✅ Uploaded to GitHub!\n\n🔗 Download Link: {github_url}")
+                    
+                    os.remove(temp_file_path)  # Clean up temp file
+                    os.remove(file_path)  # Clean up downloaded file
+                except Exception as e:
+                    logger.error(f"Error downloading M3U8: {e}")
+                    await status_message.edit(f"❌ Error downloading M3U8: {str(e)}")
+                return
             
-            try:
-                downloader = M3U8Downloader()
-                temp_file_path = await downloader.download_m3u8_from_content(file_path, progress_callback=progress_callback)
+            # Handle regular file upload
+            if event.message.document:
+                file_name = "unknown_file"
+                for attr in event.message.document.attributes:
+                    if isinstance(attr, DocumentAttributeFilename):
+                        file_name = attr.file_name
+                        break
                 
-                await status_message.edit_text("Uploading to GitHub...")
-                github_url = await github_uploader.upload_file(temp_file_path)
-                await status_message.edit_text(f"✅ Uploaded to GitHub!\n\n🔗 Download Link: {github_url}")
+                status_message = await event.respond(f"Downloading {file_name}...")
                 
-                os.remove(temp_file_path)  # Clean up temp file
-            except Exception as e:
-                logger.error(f"Error downloading M3U8: {e}")
-                await status_message.edit_text(f"❌ Error downloading M3U8: {str(e)}")
-            return
-        
-        # Handle regular file upload
-        if update.message.document:
-            file_id = update.message.document.file_id
-            file_name = update.message.document.file_name
-            status_message = await update.message.reply_text(f"Downloading {file_name}...")
+                try:
+                    file_path = await event.message.download_media()
+                    
+                    await status_message.edit(f"Uploading {file_name} to GitHub...")
+                    
+                    with open(file_path, 'rb') as f:
+                        file_data = f.read()
+                    
+                    github_url = await self.github_uploader.upload_asset(file_data, file_name)
+                    await status_message.edit(f"✅ Uploaded {file_name} to GitHub!\n\n🔗 Download Link: {github_url}")
+                    
+                    os.remove(file_path)  # Clean up temp file
+                except Exception as e:
+                    logger.error(f"Error uploading file: {e}")
+                    await status_message.edit(f"❌ Error uploading file: {str(e)}")
+                return
             
-            try:
-                file = await context.bot.get_file(file_id)
-                file_path = await file.download_as_bytearray()
-                
-                await status_message.edit_text(f"Uploading {file_name} to GitHub...")
-                github_url = await github_uploader.upload_asset(file_path, file_name)
-                await status_message.edit_text(f"✅ Uploaded {file_name} to GitHub!\n\n🔗 Download Link: {github_url}")
-            except Exception as e:
-                logger.error(f"Error uploading file: {e}")
-                await status_message.edit_text(f"❌ Error uploading file: {str(e)}")
-            return
-        
-        # Handle unknown message
-        await update.message.reply_text("🤔 I don't understand that message. Send /help for available commands.")
-        
-    except Exception as e:
-        logger.error(f"Error in handle_message: {e}")
-        await update.message.reply_text(f"❌ An error occurred: {str(e)}")
+            # Handle unknown message
+            if not event.message.text.startswith('/'):
+                await event.respond("🤔 I don't understand that message. Send /help for available commands.")
+            
+        except Exception as e:
+            logger.error(f"Error in handle_message: {e}")
+            await event.respond(f"❌ An error occurred: {str(e)}")
+    
+    async def start(self):
+        """Start the bot"""
+        await self.client.start(bot_token=self.config.telegram_bot_token)
+        logger.info("Bot started successfully!")
+        await self.client.run_until_disconnected()
 
 def main():
-    """Start the bot."""
-    # Create application
-    application = Application.builder().token(config.telegram_token).build()
-
-    # Add handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(MessageHandler(filters.ALL, handle_message))
-
-    # Run the bot
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    """Main entry point"""
+    bot = TelegramBot()
+    asyncio.run(bot.start())
 
 if __name__ == '__main__':
     main()
