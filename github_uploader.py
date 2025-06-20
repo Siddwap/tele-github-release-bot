@@ -1,4 +1,3 @@
-
 import aiohttp
 import logging
 from typing import Callable, Optional, List, Dict
@@ -6,7 +5,6 @@ import json
 import io
 import os
 import time
-import urllib.parse
 
 logger = logging.getLogger(__name__)
 
@@ -70,9 +68,8 @@ class GitHubUploader:
             # Remove existing asset if it exists
             await self.delete_existing_asset(release_id, filename)
             
-            # Properly encode filename for URL (handles Unicode characters including Hindi)
-            encoded_filename = urllib.parse.quote(filename, safe='')
-            upload_url = upload_url_template.replace('{?name,label}', f'?name={encoded_filename}')
+            # Prepare upload URL
+            upload_url = upload_url_template.replace('{?name,label}', f'?name={filename}')
             
             headers = {
                 "Authorization": f"token {self.token}",
@@ -120,21 +117,6 @@ class GitHubUploader:
         except Exception as e:
             logger.error(f"Error uploading to GitHub: {e}")
             raise
-
-    def upload_file(self, file_path: str, filename: str) -> str:
-        """Synchronous wrapper for upload_asset_streaming"""
-        import asyncio
-        
-        # Get file size
-        file_size = os.path.getsize(file_path)
-        
-        # Run async upload in sync context
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            return loop.run_until_complete(self.upload_asset_streaming(file_path, filename, file_size))
-        finally:
-            loop.close()
 
     # Keep the old method for backward compatibility
     async def upload_asset(self, file_data: bytes, filename: str, progress_callback: Optional[Callable] = None) -> str:
