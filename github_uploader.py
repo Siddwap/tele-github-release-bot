@@ -1,246 +1,259 @@
-
-import asyncio
-import logging
-import os
-import tempfile
 import aiohttp
-import subprocess
-from pathlib import Path
-from typing import Optional
-import aiofiles
-
-from config import BotConfig
+import logging
+from typing import Callable, Optional, List, Dict
+import json
+import io
+import os
+import time
 
 logger = logging.getLogger(__name__)
 
 class GitHubUploader:
-    def __init__(self, config: BotConfig):
-        self.config = config
-        self.github_token = config.github_token
-        self.repo = config.github_repo
-        self.release_tag = config.github_release_tag
+    def __init__(self, token: str, repo: str, release_tag: str):
+        self.token = token
+        self.repo = repo
+        self.release_tag = release_tag
+        self.api_url = "https://api.github.com"
+        self.upload_url = "https://uploads.github.com"
         
-        # GitHub API headers
-        self.headers = {
-            'Authorization': f'token {self.github_token}',
-            'Accept': 'application/vnd.github.v3+json',
-            'User-Agent': 'TelegramBot-GitHubUploader'
+    async def get_release_info(self) -> dict:
+        """Get release information by tag"""
+        url = f"{self.api_url}/repos/{self.repo}/releases/tags/{self.release_tag}"
+        headers = {
+            "Authorization": f"token {self.token}",
+            "Accept": "application/vnd.github.v3+json"
         }
-    
-    async def upload_file(self, file_path: str, filename: str) -> Optional[str]:
-        """Upload a file to GitHub release"""
-        try:
-            logger.info(f"Starting upload: {filename}")
-            
-            # Get release info
-            release_url = f"https://api.github.com/repos/{self.repo}/releases/tags/{self.release_tag}"
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.get(release_url, headers=self.headers) as response:
-                    if response.status != 200:
-                        logger.error(f"Failed to get release info: {response.status}")
-                        return None
-                    
-                    release_data = await response.json()
-                    upload_url = release_data['upload_url'].replace('{?name,label}', '')
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as response:
+                if response.status == 404:
+                    raise Exception(f"Release with tag '{self.release_tag}' not found")
+                elif response.status != 200:
+                    raise Exception(f"Failed to get release info: HTTP {response.status}")
                 
-                # Upload file
-                upload_url_with_params = f"{upload_url}?name={filename}"
-                
-                async with aiofiles.open(file_path, 'rb') as file:
-                    file_data = await file.read()
-                
-                upload_headers = self.headers.copy()
-                upload_headers['Content-Type'] = 'application/octet-stream'
-                
-                async with session.post(
-                    upload_url_with_params,
-                    data=file_data,
-                    headers=upload_headers
-                ) as response:
-                    if response.status in [200, 201]:
-                        result = await response.json()
-                        download_url = result['browser_download_url']
-                        logger.info(f"Successfully uploaded: {filename}")
-                        return download_url
-                    else:
-                        error_text = await response.text()
-                        logger.error(f"Upload failed: {response.status} - {error_text}")
-                        return None
-                        
-        except Exception as e:
-            logger.error(f"Error uploading file {filename}: {e}")
-            return None
-    
-    async def upload_file_from_url(self, url: str, filename: str) -> Optional[str]:
-        """Download file from URL and upload to GitHub"""
-        temp_file_path = None
-        try:
-            logger.info(f"Downloading file from URL: {url}")
-            
-            # Create temporary file
-            with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-                temp_file_path = temp_file.name
-            
-            # Download file
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url) as response:
-                    if response.status != 200:
-                        logger.error(f"Failed to download file: {response.status}")
-                        return None
-                    
-                    # Write to temp file
-                    async with aiofiles.open(temp_file_path, 'wb') as f:
-                        async for chunk in response.content.iter_chunked(8192):
-                            await f.write(chunk)
-            
-            logger.info(f"File downloaded successfully, uploading to GitHub...")
-            
-            # Upload to GitHub
-            github_url = await self.upload_file(temp_file_path, filename)
-            
-            return github_url
-            
-        except Exception as e:
-            logger.error(f"Error downloading/uploading file from URL {url}: {e}")
-            return None
-        finally:
-            # Clean up temp file
-            if temp_file_path and os.path.exists(temp_file_path):
-                os.unlink(temp_file_path)
-    
-    async def upload_m3u8_from_url(self, m3u8_url: str, filename: str) -> Optional[str]:
-        """Download M3U8 stream using yt-dlp and upload to GitHub"""
-        temp_dir = None
-        try:
-            logger.info(f"Processing M3U8 stream: {m3u8_url}")
-            
-            # Create temporary directory
-            temp_dir = tempfile.mkdtemp()
-            
-            # Ensure filename has proper extension
-            if not filename.lower().endswith(('.mp4', '.mkv', '.avi')):
-                filename += '.mp4'
-            
-            output_path = os.path.join(temp_dir, filename)
-            
-            # Use yt-dlp to download M3U8 stream
-            cmd = [
-                'yt-dlp',
-                '--no-warnings',
-                '--no-playlist',
-                '--output', output_path,
-                '--format', 'best[ext=mp4]/best',
-                '--merge-output-format', 'mp4',
-                m3u8_url
-            ]
-            
-            logger.info("Starting yt-dlp download...")
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            stdout, stderr = await process.communicate()
-            
-            if process.returncode != 0:
-                logger.error(f"yt-dlp failed: {stderr.decode()}")
-                return None
-            
-            # Check if file was created
-            if not os.path.exists(output_path):
-                # yt-dlp might have created file with different name
-                files = list(Path(temp_dir).glob('*'))
-                if files:
-                    output_path = str(files[0])
-                    # Update filename to match actual downloaded file
-                    filename = files[0].name
-                else:
-                    logger.error("No output file found after yt-dlp")
-                    return None
-            
-            logger.info(f"M3U8 download completed: {filename}")
-            
-            # Upload to GitHub
-            github_url = await self.upload_file(output_path, filename)
-            
-            return github_url
-            
-        except Exception as e:
-            logger.error(f"Error processing M3U8 stream {m3u8_url}: {e}")
-            return None
-        finally:
-            # Clean up temp directory
-            if temp_dir and os.path.exists(temp_dir):
-                import shutil
-                shutil.rmtree(temp_dir, ignore_errors=True)
-    
-    async def delete_file_from_release(self, filename: str) -> bool:
-        """Delete a file from GitHub release"""
-        try:
-            # Get release info and assets
-            release_url = f"https://api.github.com/repos/{self.repo}/releases/tags/{self.release_tag}"
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.get(release_url, headers=self.headers) as response:
-                    if response.status != 200:
-                        logger.error(f"Failed to get release info: {response.status}")
-                        return False
-                    
-                    release_data = await response.json()
-                    assets = release_data.get('assets', [])
-                
-                # Find the asset to delete
-                asset_id = None
-                for asset in assets:
-                    if asset['name'] == filename:
-                        asset_id = asset['id']
-                        break
-                
-                if not asset_id:
-                    logger.warning(f"File {filename} not found in release")
+                return await response.json()
+
+    async def delete_existing_asset(self, release_id: int, filename: str) -> bool:
+        """Delete existing asset if it exists"""
+        url = f"{self.api_url}/repos/{self.repo}/releases/{release_id}/assets"
+        headers = {
+            "Authorization": f"token {self.token}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as response:
+                if response.status != 200:
                     return False
                 
-                # Delete the asset
-                delete_url = f"https://api.github.com/repos/{self.repo}/releases/assets/{asset_id}"
-                async with session.delete(delete_url, headers=self.headers) as response:
+                assets = await response.json()
+                for asset in assets:
+                    if asset['name'] == filename:
+                        # Delete the asset
+                        delete_url = f"{self.api_url}/repos/{self.repo}/releases/assets/{asset['id']}"
+                        async with session.delete(delete_url, headers=headers) as delete_response:
+                            logger.info(f"Deleted existing asset: {filename}")
+                            return delete_response.status == 204
+                
+                return False
+
+    async def upload_asset_streaming(self, file_path: str, filename: str, file_size: int, progress_callback: Optional[Callable] = None) -> str:
+        """Upload file as release asset using streaming from file with speed tracking"""
+        try:
+            # Get release info
+            release_info = await self.get_release_info()
+            release_id = release_info['id']
+            upload_url_template = release_info['upload_url']
+            
+            # Remove existing asset if it exists
+            await self.delete_existing_asset(release_id, filename)
+            
+            # Prepare upload URL
+            upload_url = upload_url_template.replace('{?name,label}', f'?name={filename}')
+            
+            headers = {
+                "Authorization": f"token {self.token}",
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(file_size)
+            }
+            
+            # Create async generator for streaming upload with speed tracking
+            async def file_generator():
+                chunk_size = 1024 * 1024  # 1MB chunks
+                uploaded = 0
+                start_time = time.time()
+                last_callback_time = start_time
+                last_callback_bytes = 0
+                
+                with open(file_path, 'rb') as f:
+                    while True:
+                        chunk = f.read(chunk_size)
+                        if not chunk:
+                            break
+                        
+                        uploaded += len(chunk)
+                        current_time = time.time()
+                        
+                        # Call progress callback with proper speed calculation
+                        if progress_callback and (current_time - last_callback_time >= 0.5 or uploaded == file_size):
+                            await progress_callback(uploaded)
+                            last_callback_time = current_time
+                            last_callback_bytes = uploaded
+                        
+                        yield chunk
+
+            # Upload with streaming
+            async with aiohttp.ClientSession() as session:
+                async with session.post(upload_url, headers=headers, data=file_generator()) as response:
+                    if response.status not in [200, 201]:
+                        error_text = await response.text()
+                        raise Exception(f"Failed to upload asset: HTTP {response.status} - {error_text}")
+                    
+                    result = await response.json()
+                    download_url = result['browser_download_url']
+                    logger.info(f"Successfully uploaded {filename} to GitHub")
+                    return download_url
+                    
+        except Exception as e:
+            logger.error(f"Error uploading to GitHub: {e}")
+            raise
+
+    # Keep the old method for backward compatibility
+    async def upload_asset(self, file_data: bytes, filename: str, progress_callback: Optional[Callable] = None) -> str:
+        """Upload file as release asset (legacy method)"""
+        # Use streaming method with temporary file
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            temp_file.write(file_data)
+            temp_file.flush()
+            try:
+                return await self.upload_asset_streaming(temp_file.name, filename, len(file_data), progress_callback)
+            finally:
+                os.unlink(temp_file.name)
+
+    async def list_release_assets(self) -> List[Dict]:
+        """List all assets in the release with proper pagination, sorted by upload time (latest first)"""
+        try:
+            release_info = await self.get_release_info()
+            release_id = release_info['id']
+            
+            all_assets = []
+            page = 1
+            per_page = 100  # Maximum allowed by GitHub API
+            
+            while True:
+                url = f"{self.api_url}/repos/{self.repo}/releases/{release_id}/assets"
+                headers = {
+                    "Authorization": f"token {self.token}",
+                    "Accept": "application/vnd.github.v3+json"
+                }
+                params = {
+                    "page": page,
+                    "per_page": per_page
+                }
+                
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, headers=headers, params=params) as response:
+                        if response.status != 200:
+                            raise Exception(f"Failed to list assets: HTTP {response.status}")
+                        
+                        assets = await response.json()
+                        
+                        # If no assets returned, we've reached the end
+                        if not assets:
+                            break
+                        
+                        all_assets.extend(assets)
+                        
+                        # If we got fewer assets than requested, we've reached the end
+                        if len(assets) < per_page:
+                            break
+                        
+                        page += 1
+            
+            # Sort by created_at timestamp in descending order (latest first)
+            all_assets.sort(key=lambda asset: asset.get('created_at', ''), reverse=True)
+            
+            return all_assets
+                    
+        except Exception as e:
+            logger.error(f"Error listing assets: {e}")
+            raise
+
+    async def delete_asset_by_name(self, filename: str) -> bool:
+        """Delete an asset by filename"""
+        try:
+            assets = await self.list_release_assets()
+            
+            # Find the asset with matching filename
+            target_asset = None
+            for asset in assets:
+                if asset['name'] == filename:
+                    target_asset = asset
+                    break
+            
+            if not target_asset:
+                return False
+            
+            # Delete the asset
+            url = f"{self.api_url}/repos/{self.repo}/releases/assets/{target_asset['id']}"
+            headers = {
+                "Authorization": f"token {self.token}",
+                "Accept": "application/vnd.github.v3+json"
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.delete(url, headers=headers) as response:
                     if response.status == 204:
-                        logger.info(f"Successfully deleted: {filename}")
+                        logger.info(f"Successfully deleted asset: {filename}")
                         return True
                     else:
-                        logger.error(f"Failed to delete file: {response.status}")
+                        logger.error(f"Failed to delete asset: HTTP {response.status}")
                         return False
                         
         except Exception as e:
-            logger.error(f"Error deleting file {filename}: {e}")
-            return False
-    
-    async def list_release_files(self) -> list:
-        """List all files in the GitHub release"""
+            logger.error(f"Error deleting asset: {e}")
+            raise
+
+    async def rename_asset(self, old_filename: str, new_filename: str) -> bool:
+        """Rename an asset by downloading and re-uploading with new name"""
         try:
-            release_url = f"https://api.github.com/repos/{self.repo}/releases/tags/{self.release_tag}"
+            assets = await self.list_release_assets()
+            
+            # Find the asset with matching filename
+            target_asset = None
+            for asset in assets:
+                if asset['name'] == old_filename:
+                    target_asset = asset
+                    break
+            
+            if not target_asset:
+                return False
+            
+            # Download the asset content
+            download_url = target_asset['browser_download_url']
+            headers = {
+                "Authorization": f"token {self.token}",
+                "Accept": "application/octet-stream"
+            }
             
             async with aiohttp.ClientSession() as session:
-                async with session.get(release_url, headers=self.headers) as response:
-                    if response.status != 200:
-                        logger.error(f"Failed to get release info: {response.status}")
-                        return []
+                # Download the file content
+                async with session.get(download_url) as download_response:
+                    if download_response.status != 200:
+                        raise Exception(f"Failed to download asset: HTTP {download_response.status}")
                     
-                    release_data = await response.json()
-                    assets = release_data.get('assets', [])
-                    
-                    files = []
-                    for asset in assets:
-                        files.append({
-                            'name': asset['name'],
-                            'size': asset['size'],
-                            'download_url': asset['browser_download_url'],
-                            'created_at': asset['created_at']
-                        })
-                    
-                    return files
-                    
+                    file_content = await download_response.read()
+                
+                # Upload with new name
+                await self.upload_asset(file_content, new_filename)
+                
+                # Delete the old asset
+                await self.delete_asset_by_name(old_filename)
+                
+                logger.info(f"Successfully renamed asset: '{old_filename}' -> '{new_filename}'")
+                return True
+                        
         except Exception as e:
-            logger.error(f"Error listing release files: {e}")
-            return []
+            logger.error(f"Error renaming asset: {e}")
+            raise
