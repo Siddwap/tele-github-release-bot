@@ -9,6 +9,7 @@ from pathlib import Path
 from telethon import TelegramClient, events
 from telethon.tl.types import DocumentAttributeFilename
 import unicodedata
+import signal
 
 # Import existing modules
 from config import BotConfig
@@ -27,16 +28,29 @@ class TelegramBot:
         self.config = BotConfig.from_env()
         self.config.validate()
         
+        # Create session with unique name to avoid conflicts
+        session_name = f'bot_session_{os.getpid()}'
+        
         self.client = TelegramClient(
-            'bot_session',
+            session_name,
             self.config.telegram_api_id,
             self.config.telegram_api_hash
         )
         
         self.uploader = GitHubUploader(self.config)
+        self.txt_upload_mode = None  # Track upload mode for txt files
         
         # Setup event handlers
         self.setup_handlers()
+        
+        # Setup signal handlers for graceful shutdown
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+    
+    def _signal_handler(self, signum, frame):
+        """Handle shutdown signals gracefully"""
+        logger.info(f"Received signal {signum}, shutting down...")
+        asyncio.create_task(self.stop())
     
     def normalize_filename(self, filename: str) -> str:
         """Normalize filename to handle Unicode characters properly"""
@@ -309,6 +323,7 @@ filename3.m3u8 : https://example.com/stream.m3u8
                 await event.respond("❌ Access denied.")
                 return
             
+            self.txt_upload_mode = 'normal'
             await event.respond("📄 Please send a txt file with filename:url pairs for batch upload.")
         
         @self.client.on(events.NewMessage(pattern='/txt_links'))
@@ -317,6 +332,7 @@ filename3.m3u8 : https://example.com/stream.m3u8
                 await event.respond("❌ Access denied.")
                 return
             
+            self.txt_upload_mode = 'return_txt'
             await event.respond("📄 Please send a txt file with filename:url pairs. Results will be provided as a downloadable txt file.")
         
         @self.client.on(events.NewMessage)
@@ -394,10 +410,11 @@ filename3.m3u8 : https://example.com/stream.m3u8
                 
                 await progress_msg.edit(f"🔄 Found {len(files_to_upload)} files to upload. Starting batch upload...")
                 
-                # Check if this was triggered by /txt_links command context
-                return_as_txt = False
-                if hasattr(event, '_txt_links_mode'):
-                    return_as_txt = True
+                # Check upload mode
+                return_as_txt = (self.txt_upload_mode == 'return_txt')
+                
+                # Reset upload mode
+                self.txt_upload_mode = None
                 
                 # Process batch upload
                 result = await self.process_txt_file_upload(files_to_upload, return_as_txt)
@@ -479,18 +496,27 @@ filename3.m3u8 : https://example.com/stream.m3u8
     
     async def start(self):
         """Start the bot"""
-        logger.info("Starting Telegram bot...")
-        await self.client.start(bot_token=self.config.telegram_bot_token)
-        
-        me = await self.client.get_me()
-        logger.info(f"Bot started successfully: @{me.username}")
-        
-        await self.client.run_until_disconnected()
+        try:
+            logger.info("Starting Telegram bot...")
+            await self.client.start(bot_token=self.config.telegram_bot_token)
+            
+            me = await self.client.get_me()
+            logger.info(f"Bot started successfully: @{me.username}")
+            
+            await self.client.run_until_disconnected()
+        except Exception as e:
+            logger.error(f"Error starting bot: {e}")
+            raise
     
     async def stop(self):
-        """Stop the bot"""
-        logger.info("Stopping bot...")
-        await self.client.disconnect()
+        """Stop the bot gracefully"""
+        try:
+            logger.info("Stopping bot...")
+            if self.client.is_connected():
+                await self.client.disconnect()
+            logger.info("Bot stopped successfully")
+        except Exception as e:
+            logger.error(f"Error stopping bot: {e}")
 
 # Global bot instance
 bot = TelegramBot()
@@ -503,6 +529,7 @@ async def main():
         logger.info("Bot stopped by user")
     except Exception as e:
         logger.error(f"Bot error: {e}")
+        raise
     finally:
         await bot.stop()
 
