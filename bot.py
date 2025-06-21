@@ -1,3 +1,4 @@
+
 import asyncio
 import logging
 import os
@@ -13,6 +14,7 @@ from dotenv import load_dotenv
 from github_uploader import GitHubUploader
 from config import BotConfig
 import time
+import uuid
 
 load_dotenv()
 
@@ -32,13 +34,16 @@ class TelegramBot:
         self.config = BotConfig.from_env()
         self.config.validate()
         
-        self.client = TelegramClient('bot', self.config.telegram_api_id, self.config.telegram_api_hash)
+        # Generate unique session name to avoid database locks
+        session_name = f'bot_{uuid.uuid4().hex[:8]}'
+        self.client = TelegramClient(session_name, self.config.telegram_api_id, self.config.telegram_api_hash)
         self.github_uploader = GitHubUploader(self.config.github_token, self.config.github_repo, self.config.github_release_tag)
         self.active_uploads = {}
         self.upload_queues: Dict[int, deque] = {}  # User ID -> queue of uploads
         self.processing_queues: Dict[int, bool] = {}  # User ID -> is processing
         self.should_stop = False  # Flag to control stopping processes
         self.active_sessions: Dict[int, List] = {}  # User ID -> list of active aiohttp sessions
+        self.batch_results: Dict[int, List] = {}  # User ID -> list of upload results for batch operations
 
     def is_admin(self, user_id: int) -> bool:
         """Check if user is admin"""
@@ -84,8 +89,8 @@ class TelegramBot:
         if user_id in self.active_sessions and session in self.active_sessions[user_id]:
             self.active_sessions[user_id].remove(session)
 
-    def sanitize_filename(self, filename: str) -> str:
-        """Sanitize filename by replacing special characters while preserving extension"""
+    def sanitize_filename_preserve_unicode(self, filename: str) -> str:
+        """Sanitize filename while preserving Unicode characters like Hindi"""
         import re
         
         # Split filename and extension
@@ -96,21 +101,144 @@ class TelegramBot:
             name_part = filename
             extension = ''
         
-        # Replace special characters with safe alternatives
-        # Keep only alphanumeric, spaces, dots, hyphens, and underscores
-        name_part = re.sub(r'[^\w\s\-_.]', '_', name_part)
+        # Only replace truly problematic characters, preserve Unicode
+        # Remove: < > : " | ? * \ / and control characters
+        name_part = re.sub(r'[<>:"|?*\\/\x00-\x1f\x7f]', '_', name_part)
         
-        # Replace multiple spaces/underscores with single underscore
-        name_part = re.sub(r'[\s_]+', '_', name_part)
+        # Replace multiple spaces with single space
+        name_part = re.sub(r'\s+', ' ', name_part)
         
-        # Remove leading/trailing underscores
-        name_part = name_part.strip('_')
+        # Remove leading/trailing spaces and dots
+        name_part = name_part.strip(' .')
+        
+        # Ensure we have some content
+        if not name_part:
+            name_part = 'file'
         
         # Reconstruct filename with extension
         if extension:
             return f"{name_part}.{extension}"
         else:
             return name_part
+
+    def sanitize_filename(self, filename: str) -> str:
+        """Legacy sanitize method - kept for compatibility"""
+        return self.sanitize_filename_preserve_unicode(filename)
+
+    def detect_file_type_from_url(self, url: str) -> str:
+        """Detect file type from URL"""
+        url_lower = url.lower()
+        
+        # Remove query parameters for extension detection
+        clean_url = url_lower.split('?')[0]
+        
+        # Video formats
+        if any(ext in clean_url for ext in ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm']):
+            return 'video'
+        elif any(ext in clean_url for ext in ['.m3u8', '.m3u']):
+            return 'm3u8'
+        # Audio formats
+        elif any(ext in clean_url for ext in ['.mp3', '.wav', '.flac', '.aac', '.ogg']):
+            return 'audio'
+        # Document formats
+        elif any(ext in clean_url for ext in ['.pdf', '.doc', '.docx', '.txt', '.rtf']):
+            return 'document'
+        # Image formats
+        elif any(ext in clean_url for ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']):
+            return 'image'
+        # Archive formats
+        elif any(ext in clean_url for ext in ['.zip', '.rar', '.7z', '.tar', '.gz']):
+            return 'archive'
+        else:
+            return 'unknown'
+
+    def get_file_extension_from_url(self, url: str) -> str:
+        """Extract file extension from URL"""
+        clean_url = url.split('?')[0]  # Remove query parameters
+        if '.' in clean_url:
+            return clean_url.split('.')[-1].lower()
+        return ''
+
+    async def parse_txt_file_content(self, content: str) -> List[Dict]:
+        """Parse txt file content and extract filename:url pairs"""
+        lines = content.strip().split('\n')
+        parsed_items = []
+        
+        for line_num, line in enumerate(lines, 1):
+            line = line.strip()
+            if not line or line.startswith('#'):  # Skip empty lines and comments
+                continue
+            
+            if ':' in line:
+                # Split on first colon to handle URLs with colons
+                parts = line.split(':', 1)
+                if len(parts) == 2:
+                    filename = parts[0].strip()
+                    url = parts[1].strip()
+                    
+                    if filename and url:
+                        # Detect file type from URL
+                        file_type = self.detect_file_type_from_url(url)
+                        
+                        # If filename doesn't have extension, try to add one from URL
+                        if '.' not in filename:
+                            ext = self.get_file_extension_from_url(url)
+                            if ext:
+                                filename = f"{filename}.{ext}"
+                        
+                        parsed_items.append({
+                            'filename': filename,
+                            'url': url,
+                            'file_type': file_type,
+                            'line_number': line_num
+                        })
+                    else:
+                        logger.warning(f"Invalid format on line {line_num}: {line}")
+                else:
+                    logger.warning(f"Invalid format on line {line_num}: {line}")
+            else:
+                # Treat as URL only, generate filename
+                if line.startswith('http'):
+                    url = line
+                    filename = url.split('/')[-1] or f"file_{line_num}"
+                    if '?' in filename:
+                        filename = filename.split('?')[0]
+                    
+                    file_type = self.detect_file_type_from_url(url)
+                    
+                    # Add extension if missing
+                    if '.' not in filename:
+                        ext = self.get_file_extension_from_url(url)
+                        if ext:
+                            filename = f"{filename}.{ext}"
+                        else:
+                            filename = f"{filename}.bin"
+                    
+                    parsed_items.append({
+                        'filename': filename,
+                        'url': url,
+                        'file_type': file_type,
+                        'line_number': line_num
+                    })
+                else:
+                    logger.warning(f"Invalid URL on line {line_num}: {line}")
+        
+        return parsed_items
+
+    async def create_result_txt_file(self, results: List[Dict], original_filename: str) -> str:
+        """Create a txt file with the upload results"""
+        content_lines = []
+        content_lines.append(f"# Upload Results - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        content_lines.append(f"# Original file: {original_filename}")
+        content_lines.append("")
+        
+        for result in results:
+            if result['success']:
+                content_lines.append(f"{result['filename']} : {result['github_url']}")
+            else:
+                content_lines.append(f"# FAILED: {result['filename']} - {result['error']}")
+        
+        return '\n'.join(content_lines)
 
     async def add_to_queue(self, user_id: int, upload_item: dict):
         """Add upload item to user's queue"""
@@ -147,6 +275,8 @@ class TelegramBot:
                     await self.process_file_upload(upload_item)
                 elif upload_item['type'] == 'url':
                     await self.process_url_upload(upload_item)
+                elif upload_item['type'] == 'txt_batch':
+                    await self.process_txt_batch_upload(upload_item)
                 
         except Exception as e:
             logger.error(f"Error processing queue for user {user_id}: {e}")
@@ -234,6 +364,182 @@ class TelegramBot:
                 except:
                     pass
 
+    async def process_txt_batch_upload(self, upload_item: dict):
+        """Process batch upload from txt file"""
+        event = upload_item['event']
+        txt_items = upload_item['txt_items']
+        original_filename = upload_item['original_filename']
+        user_id = upload_item['user_id']
+        
+        total_items = len(txt_items)
+        results = []
+        
+        status_msg = await event.respond(
+            f"📋 **Batch Upload Started**\n\n"
+            f"📁 **Source:** `{original_filename}`\n"
+            f"📊 **Total Items:** {total_items}\n"
+            f"⏳ **Status:** Starting..."
+        )
+        
+        for i, item in enumerate(txt_items, 1):
+            if self.should_stop:
+                break
+                
+            try:
+                await status_msg.edit(
+                    f"📋 **Batch Upload Progress**\n\n"
+                    f"📁 **Source:** `{original_filename}`\n"
+                    f"📊 **Progress:** {i}/{total_items}\n"
+                    f"⏳ **Current:** `{item['filename']}`\n"
+                    f"🔗 **URL:** `{item['url'][:50]}...`"
+                )
+                
+                # Download from URL to temporary file
+                with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+                    try:
+                        file_size = await self.download_from_url_streaming_silent(item['url'], temp_file)
+                        
+                        # Sanitize filename preserving Unicode
+                        sanitized_filename = self.sanitize_filename_preserve_unicode(item['filename'])
+                        
+                        # Upload to GitHub
+                        download_url = await self.upload_to_github_streaming_silent(temp_file.name, sanitized_filename, file_size)
+                        
+                        results.append({
+                            'filename': sanitized_filename,
+                            'original_filename': item['filename'],
+                            'github_url': download_url,
+                            'success': True,
+                            'error': None
+                        })
+                        
+                        logger.info(f"Successfully uploaded {sanitized_filename} ({i}/{total_items})")
+                        
+                    except Exception as e:
+                        logger.error(f"Error uploading {item['filename']}: {e}")
+                        results.append({
+                            'filename': item['filename'],
+                            'original_filename': item['filename'],
+                            'github_url': None,
+                            'success': False,
+                            'error': str(e)
+                        })
+                    finally:
+                        try:
+                            os.unlink(temp_file.name)
+                        except:
+                            pass
+                            
+            except Exception as e:
+                logger.error(f"Error processing item {i}: {e}")
+                results.append({
+                    'filename': item['filename'],
+                    'original_filename': item['filename'],
+                    'github_url': None,
+                    'success': False,
+                    'error': str(e)
+                })
+        
+        # Create result txt file
+        try:
+            result_content = await self.create_result_txt_file(results, original_filename)
+            result_filename = f"results_{original_filename.replace('.txt', '')}_{int(time.time())}.txt"
+            
+            # Upload result file to GitHub
+            with tempfile.NamedTemporaryFile(mode='w+', suffix='.txt', delete=False, encoding='utf-8') as result_file:
+                result_file.write(result_content)
+                result_file.flush()
+                
+                try:
+                    result_size = os.path.getsize(result_file.name)
+                    result_url = await self.upload_to_github_streaming_silent(result_file.name, result_filename, result_size)
+                    
+                    # Count successes and failures
+                    successful = sum(1 for r in results if r['success'])
+                    failed = total_items - successful
+                    
+                    await status_msg.edit(
+                        f"✅ **Batch Upload Complete!**\n\n"
+                        f"📁 **Source:** `{original_filename}`\n"
+                        f"📊 **Total:** {total_items} items\n"
+                        f"✅ **Successful:** {successful}\n"
+                        f"❌ **Failed:** {failed}\n\n"
+                        f"📄 **Results File:** `{result_filename}`\n"
+                        f"🔗 **Download Results:**\n{result_url}"
+                    )
+                    
+                except Exception as e:
+                    logger.error(f"Error uploading result file: {e}")
+                    await status_msg.edit(
+                        f"⚠️ **Batch Upload Complete with Issues**\n\n"
+                        f"📁 **Source:** `{original_filename}`\n"
+                        f"📊 **Processed:** {len(results)}/{total_items}\n"
+                        f"❌ **Could not upload results file:** {str(e)}"
+                    )
+                finally:
+                    try:
+                        os.unlink(result_file.name)
+                    except:
+                        pass
+                        
+        except Exception as e:
+            logger.error(f"Error creating result file: {e}")
+            successful = sum(1 for r in results if r['success'])
+            failed = total_items - successful
+            
+            await status_msg.edit(
+                f"⚠️ **Batch Upload Complete**\n\n"
+                f"📁 **Source:** `{original_filename}`\n"
+                f"📊 **Total:** {total_items} items\n"
+                f"✅ **Successful:** {successful}\n"
+                f"❌ **Failed:** {failed}\n\n"
+                f"⚠️ **Could not generate results file**"
+            )
+
+    async def download_from_url_streaming_silent(self, url: str, temp_file) -> int:
+        """Download file from URL silently (no progress updates)"""
+        timeout = aiohttp.ClientTimeout(total=None, connect=30)
+        connector = aiohttp.TCPConnector(
+            limit=100,
+            limit_per_host=30,
+            ttl_dns_cache=300,
+            use_dns_cache=True,
+            enable_cleanup_closed=True
+        )
+        
+        session = aiohttp.ClientSession(
+            timeout=timeout,
+            connector=connector,
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+        )
+        
+        try:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    raise Exception(f"Failed to download: HTTP {response.status}")
+                
+                downloaded = 0
+                chunk_size = 8 * 1024 * 1024  # 8MB chunks
+                
+                async for chunk in response.content.iter_chunked(chunk_size):
+                    if self.should_stop:
+                        raise Exception("Upload stopped by admin command")
+                    
+                    temp_file.write(chunk)
+                    downloaded += len(chunk)
+                
+                temp_file.flush()
+                return downloaded
+        finally:
+            if not session.closed:
+                await session.close()
+
+    async def upload_to_github_streaming_silent(self, temp_file_path: str, filename: str, file_size: int) -> str:
+        """Upload file to GitHub silently (no progress updates)"""
+        return await self.github_uploader.upload_asset_streaming(temp_file_path, filename, file_size, None)
+
     async def start(self):
         """Start the bot"""
         try:
@@ -256,11 +562,14 @@ class TelegramBot:
                 "**Features:**\n"
                 "• Send multiple files - they'll upload one by one\n"
                 "• Send multiple URLs - processed in order\n"
+                "• Send TXT files with filename:url format for batch upload\n"
                 "• Real-time progress with speed display\n"
-                "• Queue system for batch uploads\n\n"
+                "• Queue system for batch uploads\n"
+                "• Preserves Unicode filenames (Hindi, etc.)\n\n"
                 "**Commands:**\n"
                 "• Send any file (up to 4GB)\n"
                 "• Send a URL to download and upload\n"
+                "• Send TXT file with filename:url pairs\n"
                 "• /help - Show this message\n"
                 "• /status - Check upload status\n"
                 "• /queue - Check queue status\n" +
@@ -282,13 +591,21 @@ class TelegramBot:
                 "**How to use:**\n\n"
                 "1. **File Upload**: Send any file directly to the bot\n"
                 "2. **URL Upload**: Send a URL pointing to a file\n"
-                "3. **Batch Upload**: Send multiple files/URLs - they'll queue automatically\n\n"
+                "3. **Batch Upload**: Send TXT file with filename:url pairs\n"
+                "4. **Queue System**: Send multiple files/URLs - they'll queue automatically\n\n"
+                "**TXT File Format for Batch Upload:**\n"
+                "```\n"
+                "movie1.mp4 : https://example.com/video1.mp4\n"
+                "document.pdf : https://example.com/doc.pdf\n"
+                "song.mp3 : https://example.com/audio.mp3\n"
+                "```\n\n"
                 "**Features:**\n"
                 "• Supports files up to 4GB\n"
                 "• Real-time progress updates with speed\n"
                 "• Queue system for multiple uploads\n"
                 "• Direct upload to GitHub releases\n"
-                "• Returns download URL after upload\n\n"
+                "• Preserves Unicode filenames (Hindi, Arabic, etc.)\n"
+                "• Batch upload generates results TXT file\n\n"
                 f"**Target Repository:** `{self.config.github_repo}`\n"
                 f"**Release Tag:** `{self.config.github_release_tag}`"
             )
@@ -563,8 +880,8 @@ class TelegramBot:
                     await event.respond("❌ **Invalid filename**\n\nPlease provide a valid new filename")
                     return
                 
-                # Sanitize the new filename
-                sanitized_filename = self.sanitize_filename(new_filename)
+                # Sanitize the new filename while preserving Unicode
+                sanitized_filename = self.sanitize_filename_preserve_unicode(new_filename)
                 if sanitized_filename != new_filename:
                     await event.respond(f"ℹ️ **Filename sanitized:** `{new_filename}` -> `{sanitized_filename}`")
                 
@@ -638,7 +955,8 @@ class TelegramBot:
                             "❓ **Invalid Input**\n\n"
                             "Please send:\n"
                             "• A file (drag & drop or attach)\n"
-                            "• A direct download URL\n\n"
+                            "• A direct download URL\n"
+                            "• A TXT file with filename:url pairs for batch upload\n\n"
                             "Use /help for more information."
                         )
                 
@@ -654,6 +972,22 @@ class TelegramBot:
             logger.info("Bot stopped by user")
         except Exception as e:
             logger.error(f"Bot disconnected with error: {e}")
+        finally:
+            # Clean up session files on shutdown
+            await self.cleanup_session_files()
+
+    async def cleanup_session_files(self):
+        """Clean up old session files"""
+        try:
+            for file in os.listdir('.'):
+                if file.startswith('bot_') and (file.endswith('.session') or file.endswith('.session-journal')):
+                    try:
+                        os.remove(file)
+                        logger.info(f"Cleaned up session file: {file}")
+                    except Exception as e:
+                        logger.warning(f"Could not remove session file {file}: {e}")
+        except Exception as e:
+            logger.warning(f"Error during session cleanup: {e}")
 
     def is_url(self, text: str) -> bool:
         """Check if text is a valid URL"""
@@ -673,18 +1007,23 @@ class TelegramBot:
                 filename = attr.file_name
                 break
         
-        # Sanitize filename to avoid GitHub upload issues
-        sanitized_filename = self.sanitize_filename(filename)
-        if sanitized_filename != filename:
-            logger.info(f"Sanitized filename: '{filename}' -> '{sanitized_filename}'")
-        
         file_size = document.size
-        logger.info(f"Queuing file: {sanitized_filename}, size: {file_size} bytes")
+        logger.info(f"Received file: {filename}, size: {file_size} bytes")
         
         # Check file size (4GB limit)
         if file_size > 4 * 1024 * 1024 * 1024:
             await event.respond("❌ File too large. Maximum size is 4GB.")
             return
+
+        # Check if it's a TXT file for batch upload
+        if filename.lower().endswith('.txt'):
+            await self.handle_txt_file_upload(event, document, filename)
+            return
+
+        # Sanitize filename preserving Unicode
+        sanitized_filename = self.sanitize_filename_preserve_unicode(filename)
+        if sanitized_filename != filename:
+            logger.info(f"Sanitized filename: '{filename}' -> '{sanitized_filename}'")
 
         # Add to queue
         upload_item = {
@@ -701,6 +1040,56 @@ class TelegramBot:
         
         await self.add_to_queue(user_id, upload_item)
 
+    async def handle_txt_file_upload(self, event, document, filename):
+        """Handle TXT file upload for batch processing"""
+        user_id = event.sender_id
+        
+        progress_msg = await event.respond("📄 **Processing TXT file...**\n⏳ Downloading and parsing...")
+        
+        try:
+            # Download TXT file content
+            with tempfile.NamedTemporaryFile(mode='w+b', delete=False) as temp_file:
+                await self.client.download_media(document, file=temp_file)
+                temp_file.flush()
+                
+                # Read and parse content
+                with open(temp_file.name, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                
+                try:
+                    os.unlink(temp_file.name)
+                except:
+                    pass
+            
+            # Parse TXT content
+            txt_items = await self.parse_txt_file_content(content)
+            
+            if not txt_items:
+                await progress_msg.edit("❌ **No valid items found in TXT file**\n\nExpected format:\n`filename.ext : https://example.com/file.ext`")
+                return
+            
+            await progress_msg.edit(
+                f"✅ **TXT file parsed successfully**\n\n"
+                f"📁 **File:** `{filename}`\n"
+                f"📊 **Items found:** {len(txt_items)}\n"
+                f"⏳ **Starting batch upload...**"
+            )
+            
+            # Add batch upload to queue
+            upload_item = {
+                'type': 'txt_batch',
+                'event': event,
+                'txt_items': txt_items,
+                'original_filename': filename,
+                'user_id': user_id
+            }
+            
+            await self.add_to_queue(user_id, upload_item)
+            
+        except Exception as e:
+            logger.error(f"Error processing TXT file: {e}")
+            await progress_msg.edit(f"❌ **Error processing TXT file**\n\n{str(e)}")
+
     async def handle_url_upload(self, event):
         """Handle URL upload by adding to queue"""
         user_id = event.sender_id
@@ -711,12 +1100,21 @@ class TelegramBot:
         if '?' in filename:
             filename = filename.split('?')[0]
         
-        # Sanitize filename to avoid GitHub upload issues
-        sanitized_filename = self.sanitize_filename(filename)
+        # Detect file type and add appropriate extension if missing
+        file_type = self.detect_file_type_from_url(url)
+        if '.' not in filename:
+            ext = self.get_file_extension_from_url(url)
+            if ext:
+                filename = f"{filename}.{ext}"
+            else:
+                filename = f"{filename}.bin"
+        
+        # Sanitize filename preserving Unicode
+        sanitized_filename = self.sanitize_filename_preserve_unicode(filename)
         if sanitized_filename != filename:
             logger.info(f"Sanitized filename: '{filename}' -> '{sanitized_filename}'")
         
-        logger.info(f"Queuing URL: {url}")
+        logger.info(f"Queuing URL: {url}, detected type: {file_type}")
         
         # Add to queue
         upload_item = {
@@ -728,7 +1126,7 @@ class TelegramBot:
         }
         
         queue_position = len(self.upload_queues.get(user_id, [])) + 1
-        await event.respond(f"📋 **URL Queued**\n\n🔗 **URL:** `{url}`\n📁 **File:** `{sanitized_filename}`\n🔢 **Position:** {queue_position}")
+        await event.respond(f"📋 **URL Queued**\n\n🔗 **URL:** `{url}`\n📁 **File:** `{sanitized_filename}`\n📋 **Type:** `{file_type}`\n🔢 **Position:** {queue_position}")
         
         await self.add_to_queue(user_id, upload_item)
 
