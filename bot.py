@@ -416,25 +416,22 @@ class TelegramBot:
                 
             try:
                 remaining = total_items - i
-                await status_msg.edit(
-                    f"📋 **Batch Upload Progress** ({i}/{total_items})\n\n"
-                    f"📁 **Source:** `{original_filename}`\n"
-                    f"📊 **Current:** `{item['filename']}`\n"
-                    f"📋 **Remaining:** {remaining} files\n"
-                    f"🔗 **URL:** `{item['url'][:50]}...`\n"
-                    f"⏳ **Progress:** {(i/total_items)*100:.1f}%"
-                )
                 
                 # Download from URL to temporary file
                 with tempfile.NamedTemporaryFile(delete=False) as temp_file:
                     try:
-                        file_size = await self.download_from_url_streaming_silent(item['url'], temp_file)
+                        # Download with individual file progress
+                        file_size = await self.download_from_url_streaming_with_progress(
+                            item['url'], temp_file, status_msg, item['filename'], i, total_items
+                        )
                         
                         # Sanitize filename preserving Unicode
                         sanitized_filename = self.sanitize_filename_preserve_unicode(item['filename'])
                         
-                        # Upload to GitHub
-                        download_url = await self.upload_to_github_streaming_silent(temp_file.name, sanitized_filename, file_size)
+                        # Upload to GitHub with individual file progress
+                        download_url = await self.upload_to_github_streaming_with_progress(
+                            temp_file.name, sanitized_filename, file_size, status_msg, i, total_items
+                        )
                         
                         results.append({
                             'filename': sanitized_filename,
@@ -471,41 +468,45 @@ class TelegramBot:
                     'error': str(e)
                 })
         
-        # Create result txt file
+        # Create result txt file and send it via Telegram
         try:
             result_content = await self.create_result_txt_file(results, original_filename)
             result_filename = f"results_{original_filename.replace('.txt', '')}_{int(time.time())}.txt"
             
-            # Upload result file to GitHub
+            # Create temporary file with results
             with tempfile.NamedTemporaryFile(mode='w+', suffix='.txt', delete=False, encoding='utf-8') as result_file:
                 result_file.write(result_content)
                 result_file.flush()
                 
                 try:
-                    result_size = os.path.getsize(result_file.name)
-                    result_url = await self.upload_to_github_streaming_silent(result_file.name, result_filename, result_size)
-                    
                     # Count successes and failures
                     successful = sum(1 for r in results if r['success'])
                     failed = total_items - successful
                     
-                    await status_msg.edit(
-                        f"✅ **Batch Upload Complete!**\n\n"
-                        f"📁 **Source:** `{original_filename}`\n"
-                        f"📊 **Total:** {total_items} items\n"
-                        f"✅ **Successful:** {successful}\n"
-                        f"❌ **Failed:** {failed}\n\n"
-                        f"📄 **Results File:** `{result_filename}`\n"
-                        f"🔗 **Download Results:**\n{result_url}"
+                    # Send the result file via Telegram
+                    await event.client.send_file(
+                        event.chat_id,
+                        result_file.name,
+                        caption=(
+                            f"✅ **Batch Upload Complete!**\n\n"
+                            f"📁 **Source:** `{original_filename}`\n"
+                            f"📊 **Total:** {total_items} items\n"
+                            f"✅ **Successful:** {successful}\n"
+                            f"❌ **Failed:** {failed}\n\n"
+                            f"📄 **Results file attached above** ⬆️"
+                        ),
+                        attributes=[DocumentAttributeFilename(result_filename)]
                     )
                     
+                    await status_msg.delete()
+                    
                 except Exception as e:
-                    logger.error(f"Error uploading result file: {e}")
+                    logger.error(f"Error sending result file: {e}")
                     await status_msg.edit(
                         f"⚠️ **Batch Upload Complete with Issues**\n\n"
                         f"📁 **Source:** `{original_filename}`\n"
                         f"📊 **Processed:** {len(results)}/{total_items}\n"
-                        f"❌ **Could not upload results file:** {str(e)}"
+                        f"❌ **Could not send results file:** {str(e)}"
                     )
                 finally:
                     try:
@@ -526,6 +527,120 @@ class TelegramBot:
                 f"❌ **Failed:** {failed}\n\n"
                 f"⚠️ **Could not generate results file**"
             )
+
+    async def download_from_url_streaming_with_progress(self, url: str, temp_file, progress_msg, filename: str, current_item: int, total_items: int) -> int:
+        """Download file from URL with individual progress tracking"""
+        timeout = aiohttp.ClientTimeout(total=None, connect=30)
+        connector = aiohttp.TCPConnector(
+            limit=100,
+            limit_per_host=30,
+            ttl_dns_cache=300,
+            use_dns_cache=True,
+            enable_cleanup_closed=True
+        )
+        
+        session = aiohttp.ClientSession(
+            timeout=timeout,
+            connector=connector,
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+        )
+        
+        user_id = getattr(progress_msg, 'sender_id', 0)
+        self.add_active_session(user_id, session)
+        
+        try:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    raise Exception(f"Failed to download: HTTP {response.status}")
+                
+                total_size = int(response.headers.get('content-length', 0))
+                downloaded = 0
+                start_time = time.time()
+                last_update_time = start_time
+                last_downloaded = 0
+                
+                chunk_size = 8 * 1024 * 1024  # 8MB chunks
+                
+                async for chunk in response.content.iter_chunked(chunk_size):
+                    if self.should_stop:
+                        raise Exception("Upload stopped by admin command")
+                    
+                    temp_file.write(chunk)
+                    downloaded += len(chunk)
+                    current_time = time.time()
+                    
+                    if total_size > 0:
+                        progress = (downloaded / total_size) * 100
+                        
+                        # Calculate speed
+                        time_diff = current_time - last_update_time
+                        bytes_diff = downloaded - last_downloaded
+                        speed = bytes_diff / time_diff if time_diff > 0 else 0
+                        
+                        # Update every 2% progress or every 2 seconds
+                        if progress - getattr(self, f'_last_batch_dl_progress_{current_item}', 0) >= 2 or time_diff >= 2:
+                            remaining = total_items - current_item
+                            await progress_msg.edit(
+                                f"📥 **Downloading...** ({current_item}/{total_items})\n\n"
+                                f"📁 **Current:** `{filename}`\n"
+                                f"📊 **Size:** {self.format_size(downloaded)} / {self.format_size(total_size)}\n"
+                                f"⏳ **Progress:** {progress:.1f}%\n"
+                                f"🚀 **Speed:** {self.format_size(speed)}/s\n"
+                                f"📋 **Remaining:** {remaining} files\n"
+                                f"{'█' * int(progress // 5)}{'░' * (20 - int(progress // 5))}"
+                            )
+                            setattr(self, f'_last_batch_dl_progress_{current_item}', progress)
+                            last_update_time = current_time
+                            last_downloaded = downloaded
+                
+                temp_file.flush()
+                return downloaded
+        finally:
+            self.remove_active_session(user_id, session)
+            if not session.closed:
+                await session.close()
+
+    async def upload_to_github_streaming_with_progress(self, temp_file_path: str, filename: str, file_size: int, progress_msg, current_item: int, total_items: int) -> str:
+        """Upload file to GitHub with individual progress tracking"""
+        uploaded = 0
+        start_time = time.time()
+        last_update_time = start_time
+        last_uploaded = 0
+        
+        async def progress_callback(current: int):
+            nonlocal uploaded, last_update_time, last_uploaded
+            
+            if self.should_stop:
+                raise Exception("Upload stopped by admin command")
+            
+            uploaded = current
+            current_time = time.time()
+            progress = (current / file_size) * 100
+            
+            # Calculate speed
+            time_diff = current_time - last_update_time
+            bytes_diff = current - last_uploaded
+            speed = bytes_diff / time_diff if time_diff > 0 else 0
+            
+            # Update every 2% progress or every 2 seconds
+            if progress - getattr(progress_callback, f'last_progress_{current_item}', 0) >= 2 or time_diff >= 2:
+                remaining = total_items - current_item
+                await progress_msg.edit(
+                    f"📤 **Uploading to GitHub...** ({current_item}/{total_items})\n\n"
+                    f"📁 **Current:** `{filename}`\n"
+                    f"📊 **Size:** {self.format_size(current)} / {self.format_size(file_size)}\n"
+                    f"⏳ **Progress:** {progress:.1f}%\n"
+                    f"🚀 **Speed:** {self.format_size(speed)}/s\n"
+                    f"📋 **Remaining:** {remaining} files\n"
+                    f"{'█' * int(progress // 5)}{'░' * (20 - int(progress // 5))}"
+                )
+                setattr(progress_callback, f'last_progress_{current_item}', progress)
+                last_update_time = current_time
+                last_uploaded = current
+        
+        return await self.github_uploader.upload_asset_streaming(temp_file_path, filename, file_size, progress_callback)
 
     async def download_from_url_streaming_silent(self, url: str, temp_file) -> int:
         """Download file from URL silently (no progress updates)"""
@@ -612,6 +727,8 @@ class TelegramBot:
                 "• /restart - Restart all processes (Admin only)" if is_admin else "")
             )
             raise events.StopPropagation
+
+        # ... keep existing code (all event handlers for help, stop, restart, status, queue, list, search, delete, rename, callbacks, etc.)
 
         @self.client.on(events.NewMessage(pattern='/help'))
         async def help_handler(event):
@@ -720,8 +837,6 @@ class TelegramBot:
             else:
                 await event.respond("📋 Queue is empty")
             raise events.StopPropagation
-
-        # ... keep existing code (list, search, delete, rename handlers and other methods)
 
         @self.client.on(events.NewMessage(pattern='/list'))
         async def list_handler(event):
