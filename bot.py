@@ -7,7 +7,7 @@ import sys
 import tempfile
 from pathlib import Path
 from telethon import TelegramClient, events
-from telethon.tl.types import DocumentAttributeFilename
+from telethon.tl.types import DocumentAttributeFilename, MessageMediaDocument, MessageMediaPhoto
 import unicodedata
 import signal
 
@@ -346,7 +346,7 @@ filename3.m3u8 : https://example.com/stream.m3u8
             
             try:
                 # Handle file uploads
-                if event.file:
+                if event.media:
                     await self.handle_file_upload(event)
                 # Handle URL messages
                 elif event.text and ('http://' in event.text or 'https://' in event.text):
@@ -362,21 +362,43 @@ filename3.m3u8 : https://example.com/stream.m3u8
     async def handle_file_upload(self, event):
         """Handle file upload from Telegram"""
         try:
-            # Get file info
-            file = event.file
-            if not file:
+            # Check if event has media
+            if not event.media:
                 await event.respond("❌ No file detected.")
                 return
             
-            # Get original filename
+            # Handle different media types
+            media = event.media
             original_filename = "unknown_file"
-            if file.name:
-                original_filename = file.name
-            elif hasattr(file, 'attributes'):
-                for attr in file.attributes:
+            file_size = 0
+            
+            if isinstance(media, MessageMediaDocument):
+                document = media.document
+                file_size = document.size
+                
+                # Get filename from document attributes
+                for attr in document.attributes:
                     if isinstance(attr, DocumentAttributeFilename):
                         original_filename = attr.file_name
                         break
+                
+                # If no filename attribute, try to get from mime_type
+                if original_filename == "unknown_file" and document.mime_type:
+                    if document.mime_type == 'text/plain':
+                        original_filename = "document.txt"
+                    elif document.mime_type.startswith('image/'):
+                        ext = document.mime_type.split('/')[-1]
+                        original_filename = f"image.{ext}"
+                    elif document.mime_type.startswith('video/'):
+                        ext = document.mime_type.split('/')[-1]
+                        original_filename = f"video.{ext}"
+                    elif document.mime_type.startswith('audio/'):
+                        ext = document.mime_type.split('/')[-1]
+                        original_filename = f"audio.{ext}"
+            
+            elif isinstance(media, MessageMediaPhoto):
+                original_filename = f"photo_{event.id}.jpg"
+                # Photo size is not directly available, will be determined after download
             
             # Normalize filename for Unicode/Hindi support
             safe_filename = self.normalize_filename(original_filename)
@@ -387,7 +409,7 @@ filename3.m3u8 : https://example.com/stream.m3u8
                 progress_msg = await event.respond("📥 Downloading txt file...")
                 
                 with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-                    await self.client.download_file(file, temp_file.name)
+                    await self.client.download_media(event.media, temp_file.name)
                     
                     # Read content with proper encoding
                     try:
@@ -426,7 +448,7 @@ filename3.m3u8 : https://example.com/stream.m3u8
                 
                 # Create temp file
                 with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-                    await self.client.download_file(file, temp_file.name)
+                    await self.client.download_media(event.media, temp_file.name)
                     
                     # Upload to GitHub
                     github_url = await self.uploader.upload_file(temp_file.name, safe_filename)
@@ -435,8 +457,8 @@ filename3.m3u8 : https://example.com/stream.m3u8
                     os.unlink(temp_file.name)
                 
                 if github_url:
-                    file_size = self.format_file_size(file.size) if file.size else ""
-                    response = format_upload_complete_message(github_url, safe_filename, file_size)
+                    file_size_str = self.format_file_size(file_size) if file_size else ""
+                    response = format_upload_complete_message(github_url, safe_filename, file_size_str)
                     await progress_msg.edit(response)
                 else:
                     await progress_msg.edit("❌ Upload failed. Please try again.")
