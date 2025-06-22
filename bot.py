@@ -1313,8 +1313,8 @@ class TelegramBot:
             bytes_diff = current - last_downloaded
             speed = bytes_diff / time_diff if time_diff > 0 else 0
             
-            # Update every 2% progress or every 2 seconds
-            if progress - getattr(progress_callback, 'last_progress', 0) >= 2 or time_diff >= 2:
+            # Update every 5% progress or every 5 seconds
+            if progress - getattr(progress_callback, 'last_progress', 0) >= 5 or time_diff >= 5:
                 remaining = len(self.upload_queues.get(getattr(progress_msg, 'sender_id', 0), []))
                 await progress_msg.edit(
                     f"📥 **Downloading from Telegram...** ({current_item}/{total_items})\n\n"
@@ -1391,8 +1391,8 @@ class TelegramBot:
                         bytes_diff = downloaded - last_downloaded
                         speed = bytes_diff / time_diff if time_diff > 0 else 0
                         
-                        # Update every 2% progress or every 2 seconds
-                        if progress - getattr(self, '_last_url_progress', 0) >= 2 or time_diff >= 2:
+                        # Update every 10% progress or every 10 seconds
+                        if progress - getattr(self, '_last_url_progress', 0) >= 10 or time_diff >= 10:
                             remaining = len(self.upload_queues.get(user_id, []))
                             await progress_msg.edit(
                                 f"📥 **Downloading from URL...** ({current_item}/{total_items})\n\n"
@@ -1437,8 +1437,8 @@ class TelegramBot:
             bytes_diff = current - last_uploaded
             speed = bytes_diff / time_diff if time_diff > 0 else 0
             
-            # Update every 2% progress or every 2 seconds
-            if progress - getattr(progress_callback, 'last_progress', 0) >= 2 or time_diff >= 2:
+            # Update every 10% progress or every 10 seconds
+            if progress - getattr(progress_callback, 'last_progress', 0) >= 10 or time_diff >= 10:
                 user_id = getattr(progress_msg, 'sender_id', 0)
                 remaining = len(self.upload_queues.get(user_id, []))
                 await progress_msg.edit(
