@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 import os
@@ -579,8 +578,8 @@ class TelegramBot:
                         bytes_diff = downloaded - last_downloaded
                         speed = bytes_diff / time_diff if time_diff > 0 else 0
                         
-                        # Update every 2% progress or every 2 seconds
-                        if progress - getattr(self, f'_last_batch_dl_progress_{current_item}', 0) >= 2 or time_diff >= 2:
+                        # Update every 10% progress or every 10 seconds
+                        if progress - getattr(self, f'_last_batch_dl_progress_{current_item}', 0) >= 10 or time_diff >= 10:
                             remaining = total_items - current_item
                             await progress_msg.edit(
                                 f"📥 **Downloading...** ({current_item}/{total_items})\n\n"
@@ -594,6 +593,7 @@ class TelegramBot:
                             setattr(self, f'_last_batch_dl_progress_{current_item}', progress)
                             last_update_time = current_time
                             last_downloaded = downloaded
+                            await asyncio.sleep(1)  # Add 1-second delay to prevent flood wait
                 
                 temp_file.flush()
                 return downloaded
@@ -624,8 +624,8 @@ class TelegramBot:
             bytes_diff = current - last_uploaded
             speed = bytes_diff / time_diff if time_diff > 0 else 0
             
-            # Update every 2% progress or every 2 seconds
-            if progress - getattr(progress_callback, f'last_progress_{current_item}', 0) >= 2 or time_diff >= 2:
+            # Update every 10% progress or every 10 seconds
+            if progress - getattr(progress_callback, f'last_progress_{current_item}', 0) >= 10 or time_diff >= 10:
                 remaining = total_items - current_item
                 await progress_msg.edit(
                     f"📤 **Uploading to GitHub...** ({current_item}/{total_items})\n\n"
@@ -639,6 +639,7 @@ class TelegramBot:
                 setattr(progress_callback, f'last_progress_{current_item}', progress)
                 last_update_time = current_time
                 last_uploaded = current
+                await asyncio.sleep(1)  # Add 1-second delay to prevent flood wait
         
         return await self.github_uploader.upload_asset_streaming(temp_file_path, filename, file_size, progress_callback)
 
@@ -727,8 +728,6 @@ class TelegramBot:
                 "• /restart - Restart all processes (Admin only)" if is_admin else "")
             )
             raise events.StopPropagation
-
-        # ... keep existing code (all event handlers for help, stop, restart, status, queue, list, search, delete, rename, callbacks, etc.)
 
         @self.client.on(events.NewMessage(pattern='/help'))
         async def help_handler(event):
@@ -826,16 +825,16 @@ class TelegramBot:
                 queue_count = len(self.upload_queues[user_id])
                 queue_items = []
                 for i, item in enumerate(list(self.upload_queues[user_id])[:5]):  # Show first 5
-                    filename = item.get('filename', item.get('original_filename', 'Unknown File'))
+                    filename = item.get('filename', '').strip()
                     queue_items.append(f"{i+1}. {filename}")
                 
                 queue_text = "\n".join(queue_items)
                 if queue_count > 5:
                     queue_text += f"\n... and {queue_count - 5} more"
                 
-                await event.respond(f"📋 **Upload Queue ({queue_count} items):**\n\n{queue_text}")
+                await event.respond(f"📋 **Upload Queue** ({queue_count} items):\n\n{queue_text}")
             else:
-                await event.respond("📋 Queue is empty")
+                await event.respond("📋 **Queue is empty**")
             raise events.StopPropagation
 
         @self.client.on(events.NewMessage(pattern='/list'))
@@ -855,16 +854,16 @@ class TelegramBot:
         async def callback_handler(event):
             user_id = event.sender_id
             if not self.is_admin(user_id):
-                await event.answer("Access denied", alert=True)
+                await event.answer("Access denied.", alert=True)
                 return
             
-            data = event.data.decode('utf-8')
+            data = event.data.decode('_utf8')
             
             if data.startswith('list_page_'):
                 page = int(data.split('_')[2])
-                await send_file_list(event, page, edit=True)
+                await send_file_list(event, edit=True)
                 await event.answer()
-            elif data == 'close_list':
+            elif data == close_list':
                 await event.delete()
                 await event.answer()
 
@@ -873,7 +872,7 @@ class TelegramBot:
             assets = await self.github_uploader.list_release_assets()
             if not assets:
                 if edit:
-                    await event.edit("📂 **No files found in release**")
+                    await event.edit("📂 **File not found in release**")
                 else:
                     await event.respond("📂 **No files found in release**")
                 return
@@ -961,9 +960,9 @@ class TelegramBot:
                 
                 response = f"🔍 **Search Results for:** `{search_term}`\n\n"
                 
-                for original_num, asset in matching_assets[:20]:  # Limit to 20 results
+                for i, asset in matching_assets[:20]:  # Limit to 20 results
                     size_mb = asset['size'] / (1024 * 1024)
-                    response += f"**{original_num}.** `{asset['name']}`\n"
+                    response += f"**{i}.** `{asset['name']}`\n"
                     response += f"   📊 Size: {size_mb:.1f} MB\n"
                     response += f"   🔗 [Download]({asset['browser_download_url']})\n\n"
                 
@@ -1001,7 +1000,7 @@ class TelegramBot:
                     await event.respond(f"❌ **File number {file_number} not found**\n\nTotal files: {len(assets)}")
                     return
                 
-                # Get the asset to delete (subtract 1 for 0-based indexing)
+                # Get the target asset to delete (subtract 1 for 0-based indexing)
                 target_asset = assets[file_number - 1]
                 filename = target_asset['name']
                 
@@ -1009,7 +1008,7 @@ class TelegramBot:
                 if success:
                     await event.respond(
                         f"✅ **File deleted successfully**\n\n"
-                        f"🗑️ **File #{file_number}:** `{filename}`"
+                        f"📁 **File #{file_number}:** `{filename}`"
                     )
                 else:
                     await event.respond(f"❌ **Failed to delete file**\n\n📁 **File:** `{filename}`")
@@ -1053,7 +1052,7 @@ class TelegramBot:
                     await event.respond(f"❌ **File number {file_number} not found**\n\nTotal files: {len(assets)}")
                     return
                 
-                # Get the asset to rename (subtract 1 for 0-based indexing)
+                # Get the asset to rename (subtract 1 for index 0-based indexing)
                 target_asset = assets[file_number - 1]
                 old_filename = target_asset['name']
                 
@@ -1063,7 +1062,9 @@ class TelegramBot:
                         await event.respond(f"❌ **Filename already exists**\n\n📁 **File:** `{sanitized_filename}`")
                         return
                 
-                progress_msg = await event.respond(f"🔄 **Renaming file...**\n\n📁 **From:** `{old_filename}`\n📁 **To:** `{sanitized_filename}`")
+                progress_msg = await event.respond(f"🔄 **Renaming file...**\n\n"
+                                    f"📋 **From:** `{old_filename}`\n"
+                                    f"📋 **To:** `{sanitized_filename}`")
                 
                 success = await self.github_uploader.rename_asset(old_filename, sanitized_filename)
                 if success:
@@ -1123,7 +1124,7 @@ class TelegramBot:
                 
             except Exception as e:
                 logger.error(f"Error handling message from user {user_id}: {e}")
-                await event.respond(f"❌ **Error**\n\nSomething went wrong: {str(e)}")
+                await event.respond(f"Error**\n\nSomething went wrong: {str(e)}")
 
         try:
             await self.client.run_until_disconnected()
