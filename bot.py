@@ -825,16 +825,16 @@ class TelegramBot:
                 queue_count = len(self.upload_queues[user_id])
                 queue_items = []
                 for i, item in enumerate(list(self.upload_queues[user_id])[:5]):  # Show first 5
-                    filename = item.get('filename', '').strip()
+                    filename = item.get('filename', item.get('original_filename', 'Unknown File'))
                     queue_items.append(f"{i+1}. {filename}")
                 
                 queue_text = "\n".join(queue_items)
                 if queue_count > 5:
                     queue_text += f"\n... and {queue_count - 5} more"
                 
-                await event.respond(f"📋 **Upload Queue** ({queue_count} items):\n\n{queue_text}")
+                await event.respond(f"📋 **Upload Queue ({queue_count} items):**\n\n{queue_text}")
             else:
-                await event.respond("📋 **Queue is empty**")
+                await event.respond("📋 Queue is empty")
             raise events.StopPropagation
 
         @self.client.on(events.NewMessage(pattern='/list'))
@@ -854,16 +854,16 @@ class TelegramBot:
         async def callback_handler(event):
             user_id = event.sender_id
             if not self.is_admin(user_id):
-                await event.answer("Access denied.", alert=True)
+                await event.answer("Access denied", alert=True)
                 return
             
-            data = event.data.decode('_utf8')
+            data = event.data.decode('utf-8')
             
             if data.startswith('list_page_'):
                 page = int(data.split('_')[2])
-                await send_file_list(event, edit=True)
+                await send_file_list(event, page, edit=True)
                 await event.answer()
-            elif data == close_list':
+            elif data == 'close_list':
                 await event.delete()
                 await event.answer()
 
@@ -872,7 +872,7 @@ class TelegramBot:
             assets = await self.github_uploader.list_release_assets()
             if not assets:
                 if edit:
-                    await event.edit("📂 **File not found in release**")
+                    await event.edit("📂 **No files found in release**")
                 else:
                     await event.respond("📂 **No files found in release**")
                 return
@@ -960,9 +960,9 @@ class TelegramBot:
                 
                 response = f"🔍 **Search Results for:** `{search_term}`\n\n"
                 
-                for i, asset in matching_assets[:20]:  # Limit to 20 results
+                for original_num, asset in matching_assets[:20]:  # Limit to 20 results
                     size_mb = asset['size'] / (1024 * 1024)
-                    response += f"**{i}.** `{asset['name']}`\n"
+                    response += f"**{original_num}.** `{asset['name']}`\n"
                     response += f"   📊 Size: {size_mb:.1f} MB\n"
                     response += f"   🔗 [Download]({asset['browser_download_url']})\n\n"
                 
@@ -1000,7 +1000,7 @@ class TelegramBot:
                     await event.respond(f"❌ **File number {file_number} not found**\n\nTotal files: {len(assets)}")
                     return
                 
-                # Get the target asset to delete (subtract 1 for 0-based indexing)
+                # Get the asset to delete (subtract 1 for 0-based indexing)
                 target_asset = assets[file_number - 1]
                 filename = target_asset['name']
                 
@@ -1008,7 +1008,7 @@ class TelegramBot:
                 if success:
                     await event.respond(
                         f"✅ **File deleted successfully**\n\n"
-                        f"📁 **File #{file_number}:** `{filename}`"
+                        f"🗑️ **File #{file_number}:** `{filename}`"
                     )
                 else:
                     await event.respond(f"❌ **Failed to delete file**\n\n📁 **File:** `{filename}`")
@@ -1052,7 +1052,7 @@ class TelegramBot:
                     await event.respond(f"❌ **File number {file_number} not found**\n\nTotal files: {len(assets)}")
                     return
                 
-                # Get the asset to rename (subtract 1 for index 0-based indexing)
+                # Get the asset to rename (subtract 1 for 0-based indexing)
                 target_asset = assets[file_number - 1]
                 old_filename = target_asset['name']
                 
@@ -1062,9 +1062,7 @@ class TelegramBot:
                         await event.respond(f"❌ **Filename already exists**\n\n📁 **File:** `{sanitized_filename}`")
                         return
                 
-                progress_msg = await event.respond(f"🔄 **Renaming file...**\n\n"
-                                    f"📋 **From:** `{old_filename}`\n"
-                                    f"📋 **To:** `{sanitized_filename}`")
+                progress_msg = await event.respond(f"🔄 **Renaming file...**\n\n📁 **From:** `{old_filename}`\n📁 **To:** `{sanitized_filename}`")
                 
                 success = await self.github_uploader.rename_asset(old_filename, sanitized_filename)
                 if success:
@@ -1124,7 +1122,7 @@ class TelegramBot:
                 
             except Exception as e:
                 logger.error(f"Error handling message from user {user_id}: {e}")
-                await event.respond(f"Error**\n\nSomething went wrong: {str(e)}")
+                await event.respond(f"❌ **Error**\n\nSomething went wrong: {str(e)}")
 
         try:
             await self.client.run_until_disconnected()
