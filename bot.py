@@ -14,6 +14,8 @@ from github_uploader import GitHubUploader
 from config import BotConfig
 import time
 import uuid
+import yt_dlp
+import re
 
 load_dotenv()
 
@@ -43,6 +45,7 @@ class TelegramBot:
         self.should_stop = False  # Flag to control stopping processes
         self.active_sessions: Dict[int, List] = {}  # User ID -> list of active aiohttp sessions
         self.batch_results: Dict[int, List] = {}  # User ID -> list of upload results for batch operations
+        self.youtube_pending: Dict[int, Dict] = {}  # User ID -> YouTube URL and info for quality selection
 
     def is_admin(self, user_id: int) -> bool:
         """Check if user is admin"""
@@ -710,12 +713,14 @@ class TelegramBot:
                 "• Send multiple files - they'll upload one by one\n"
                 "• Send multiple URLs - processed in order\n"
                 "• Send TXT files with filename:url format for batch upload\n"
+                "• YouTube video download and upload with quality selection\n"
                 "• Real-time progress with speed display\n"
                 "• Queue system for batch uploads\n"
                 "• Preserves Unicode filenames (Hindi, etc.)\n\n"
                 "**Commands:**\n"
                 "• Send any file (up to 4GB)\n"
                 "• Send a URL to download and upload\n"
+                "• Send YouTube URL (youtube.com or youtu.be)\n"
                 "• Send TXT file with filename:url pairs\n"
                 "• /help - Show this message\n"
                 "• /status - Check upload status\n"
@@ -738,14 +743,20 @@ class TelegramBot:
                 "**How to use:**\n\n"
                 "1. **File Upload**: Send any file directly to the bot\n"
                 "2. **URL Upload**: Send a URL pointing to a file\n"
-                "3. **Batch Upload**: Send TXT file with filename:url pairs\n"
-                "4. **Queue System**: Send multiple files/URLs - they'll queue automatically\n\n"
+                "3. **YouTube Upload**: Send YouTube URL (youtube.com or youtu.be) and select quality\n"
+                "4. **Batch Upload**: Send TXT file with filename:url pairs\n"
+                "5. **Queue System**: Send multiple files/URLs - they'll queue automatically\n\n"
                 "**TXT File Format for Batch Upload:**\n"
                 "```\n"
                 "movie1.mp4 : https://example.com/video1.mp4\n"
                 "document.pdf : https://example.com/doc.pdf\n"
                 "song.mp3 : https://example.com/audio.mp3\n"
                 "```\n\n"
+                "**YouTube Downloads:**\n"
+                "• Supports youtube.com and youtu.be links\n"
+                "• Select from multiple quality options (360p, 720p, 1080p, etc.)\n"
+                "• Automatically merges best video and audio\n"
+                "• Downloads as MP4 format\n\n"
                 "**Features:**\n"
                 "• Supports files up to 4GB\n"
                 "• Real-time progress updates with speed\n"
@@ -853,19 +864,98 @@ class TelegramBot:
         @self.client.on(events.CallbackQuery)
         async def callback_handler(event):
             user_id = event.sender_id
-            if not self.is_admin(user_id):
-                await event.answer("Access denied", alert=True)
-                return
-            
             data = event.data.decode('utf-8')
             
-            if data.startswith('list_page_'):
-                page = int(data.split('_')[2])
-                await send_file_list(event, page, edit=True)
-                await event.answer()
-            elif data == 'close_list':
+            # Handle admin commands
+            if data.startswith('list_page_') or data == 'close_list':
+                if not self.is_admin(user_id):
+                    await event.answer("Access denied", alert=True)
+                    return
+                
+                if data.startswith('list_page_'):
+                    page = int(data.split('_')[2])
+                    await send_file_list(event, page, edit=True)
+                    await event.answer()
+                elif data == 'close_list':
+                    await event.delete()
+                    await event.answer()
+            
+            # Handle YouTube quality selection
+            elif data.startswith('yt_quality_'):
+                quality = data.replace('yt_quality_', '')
+                
+                if user_id not in self.youtube_pending:
+                    await event.answer("Session expired. Please send the YouTube URL again.", alert=True)
+                    return
+                
+                youtube_info = self.youtube_pending[user_id]
+                url = youtube_info['url']
+                title = youtube_info['title']
+                
+                # Generate filename from title
+                filename = self.sanitize_filename_preserve_unicode(f"{title}.mp4")
+                
+                await event.answer(f"Downloading in {quality}...")
+                
+                # Delete the quality selection message
+                try:
+                    await event.delete()
+                except:
+                    pass
+                
+                # Start download
+                progress_msg = await event.respond(
+                    f"📥 **Starting YouTube Download...**\n\n"
+                    f"📁 **Title:** `{title}`\n"
+                    f"🎬 **Quality:** {quality}\n"
+                    f"⏳ **Initializing...**"
+                )
+                
+                try:
+                    # Download YouTube video
+                    temp_file_path = await self.download_youtube_video(url, quality, progress_msg, filename)
+                    
+                    if not temp_file_path or not os.path.exists(temp_file_path):
+                        await progress_msg.edit("❌ **Download failed**\n\nCould not download video from YouTube.")
+                        return
+                    
+                    # Get file size
+                    file_size = os.path.getsize(temp_file_path)
+                    
+                    # Upload to GitHub
+                    await self.upload_to_github_streaming(temp_file_path, filename, file_size, progress_msg, 1, 1)
+                    
+                    download_url = f"https://github.com/{self.config.github_repo}/releases/download/{self.config.github_release_tag}/{filename}"
+                    
+                    await progress_msg.edit(
+                        f"✅ **YouTube Video Uploaded!**\n\n"
+                        f"📁 **File:** `{filename}`\n"
+                        f"📊 **Size:** {self.format_size(file_size)}\n"
+                        f"🎬 **Quality:** {quality}\n"
+                        f"🔗 **Download URL:**\n{download_url}"
+                    )
+                    
+                    # Clean up
+                    try:
+                        os.unlink(temp_file_path)
+                    except:
+                        pass
+                    
+                    # Remove from pending
+                    del self.youtube_pending[user_id]
+                    
+                except Exception as e:
+                    logger.error(f"Error processing YouTube download: {e}")
+                    await progress_msg.edit(f"❌ **Upload Failed**\n\nError: {str(e)}")
+                    
+                    # Clean up
+                    del self.youtube_pending[user_id]
+            
+            elif data == 'yt_cancel':
+                if user_id in self.youtube_pending:
+                    del self.youtube_pending[user_id]
                 await event.delete()
-                await event.answer()
+                await event.answer("Cancelled")
 
         async def send_file_list(event, page=1, edit=False):
             """Send file list with pagination buttons"""
@@ -1103,6 +1193,13 @@ class TelegramBot:
                 # Handle URL messages
                 if event.message.text:
                     text = event.message.text.strip()
+                    
+                    # Check if it's a YouTube URL
+                    if self.is_youtube_url(text):
+                        await self.handle_youtube_url(event)
+                        return
+                    
+                    # Regular URL handling
                     if self.is_url(text):
                         await self.handle_url_upload(event)
                         return
@@ -1152,6 +1249,132 @@ class TelegramBot:
         if not text:
             return False
         return text.startswith(('http://', 'https://')) and len(text) > 8
+    
+    def is_youtube_url(self, text: str) -> bool:
+        """Check if text is a YouTube URL"""
+        if not text:
+            return False
+        youtube_patterns = [
+            r'(https?://)?(www\.)?(youtube\.com|youtu\.be)/.+',
+        ]
+        for pattern in youtube_patterns:
+            if re.match(pattern, text, re.IGNORECASE):
+                return True
+        return False
+    
+    async def get_youtube_formats(self, url: str) -> Dict:
+        """Get available formats for YouTube video"""
+        try:
+            ydl_opts = {
+                'quiet': True,
+                'no_warnings': True,
+                'extract_flat': False,
+            }
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: ydl.extract_info(url, download=False)
+                )
+                
+                # Extract video title and available formats
+                title = info.get('title', 'video')
+                formats = info.get('formats', [])
+                
+                # Group formats by quality
+                quality_map = {}
+                for fmt in formats:
+                    if fmt.get('vcodec') != 'none' and fmt.get('acodec') != 'none':  # Has both video and audio
+                        height = fmt.get('height')
+                        if height:
+                            quality = f"{height}p"
+                            if quality not in quality_map:
+                                quality_map[quality] = fmt['format_id']
+                
+                # Sort qualities by resolution
+                sorted_qualities = sorted(
+                    quality_map.items(),
+                    key=lambda x: int(x[0].replace('p', '')),
+                    reverse=True
+                )
+                
+                return {
+                    'title': title,
+                    'qualities': sorted_qualities,
+                    'url': url
+                }
+        except Exception as e:
+            logger.error(f"Error getting YouTube formats: {e}")
+            return None
+    
+    async def download_youtube_video(self, url: str, quality: str, progress_msg, filename: str) -> Optional[str]:
+        """Download YouTube video with specified quality"""
+        temp_file = None
+        try:
+            # Create temporary file
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+            temp_file.close()
+            
+            # Progress hook
+            last_update = [0]
+            
+            def progress_hook(d):
+                if d['status'] == 'downloading':
+                    try:
+                        percent = d.get('_percent_str', '0%').strip()
+                        speed = d.get('_speed_str', 'N/A').strip()
+                        eta = d.get('_eta_str', 'N/A').strip()
+                        
+                        # Update progress every 5%
+                        current_percent = float(percent.replace('%', ''))
+                        if current_percent - last_update[0] >= 5:
+                            last_update[0] = current_percent
+                            asyncio.create_task(progress_msg.edit(
+                                f"📥 **Downloading YouTube Video...**\n\n"
+                                f"📁 **File:** `{filename}`\n"
+                                f"📊 **Progress:** {percent}\n"
+                                f"⚡ **Speed:** {speed}\n"
+                                f"⏱️ **ETA:** {eta}"
+                            ))
+                    except:
+                        pass
+                elif d['status'] == 'finished':
+                    asyncio.create_task(progress_msg.edit(
+                        f"✅ **Download Complete**\n\n"
+                        f"📁 **File:** `{filename}`\n"
+                        f"⏳ **Processing and uploading...**"
+                    ))
+            
+            ydl_opts = {
+                'format': f'bestvideo[height<={quality.replace("p", "")}]+bestaudio/best[height<={quality.replace("p", "")}]',
+                'outtmpl': temp_file.name,
+                'merge_output_format': 'mp4',
+                'progress_hooks': [progress_hook],
+                'quiet': True,
+                'no_warnings': True,
+            }
+            
+            await progress_msg.edit(
+                f"📥 **Starting YouTube Download...**\n\n"
+                f"📁 **File:** `{filename}`\n"
+                f"🎬 **Quality:** {quality}\n"
+                f"⏳ **Initializing...**"
+            )
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: ydl.download([url])
+                )
+            
+            return temp_file.name
+            
+        except Exception as e:
+            logger.error(f"Error downloading YouTube video: {e}")
+            if temp_file and os.path.exists(temp_file.name):
+                try:
+                    os.unlink(temp_file.name)
+                except:
+                    pass
+            raise e
 
     async def handle_file_upload(self, event):
         """Handle file upload by adding to queue"""
@@ -1287,6 +1510,61 @@ class TelegramBot:
         await event.respond(f"📋 **URL Queued**\n\n🔗 **URL:** `{url}`\n📁 **File:** `{sanitized_filename}`\n📋 **Type:** `{file_type}`\n🔢 **Position:** {queue_position}")
         
         await self.add_to_queue(user_id, upload_item)
+    
+    async def handle_youtube_url(self, event):
+        """Handle YouTube URL by showing quality options"""
+        user_id = event.sender_id
+        url = event.message.text.strip()
+        
+        progress_msg = await event.respond("🎬 **Fetching YouTube video info...**\n⏳ Please wait...")
+        
+        try:
+            youtube_info = await self.get_youtube_formats(url)
+            
+            if not youtube_info:
+                await progress_msg.edit("❌ **Failed to fetch video info**\n\nPlease check if the URL is valid.")
+                return
+            
+            title = youtube_info['title']
+            qualities = youtube_info['qualities']
+            
+            if not qualities:
+                await progress_msg.edit(
+                    "❌ **No suitable video formats found**\n\n"
+                    "Please try a different video or use a direct download link."
+                )
+                return
+            
+            # Store info for callback
+            self.youtube_pending[user_id] = youtube_info
+            
+            # Create quality buttons (max 2 per row)
+            buttons = []
+            current_row = []
+            for quality, format_id in qualities[:8]:  # Limit to 8 qualities
+                current_row.append(Button.inline(f"📺 {quality}", f"yt_quality_{quality}"))
+                if len(current_row) == 2:
+                    buttons.append(current_row)
+                    current_row = []
+            
+            # Add remaining button if any
+            if current_row:
+                buttons.append(current_row)
+            
+            # Add cancel button
+            buttons.append([Button.inline("❌ Cancel", "yt_cancel")])
+            
+            await progress_msg.edit(
+                f"🎬 **YouTube Video Found**\n\n"
+                f"📁 **Title:** `{title}`\n"
+                f"📊 **Available Qualities:** {len(qualities)}\n\n"
+                f"**Select quality to download:**",
+                buttons=buttons
+            )
+            
+        except Exception as e:
+            logger.error(f"Error handling YouTube URL: {e}")
+            await progress_msg.edit(f"❌ **Error**\n\n{str(e)}")
 
     async def download_telegram_file_streaming(self, document, temp_file, progress_msg, filename: str, current_item: int = 1, total_items: int = 1):
         """Download file from Telegram with progress and speed using streaming to temp file - OPTIMIZED"""
