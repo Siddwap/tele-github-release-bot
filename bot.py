@@ -1269,6 +1269,7 @@ class TelegramBot:
                 'quiet': True,
                 'no_warnings': True,
                 'extract_flat': False,
+                'cookiefile': 'cookies.txt',
             }
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -1351,6 +1352,7 @@ class TelegramBot:
                 'progress_hooks': [progress_hook],
                 'quiet': True,
                 'no_warnings': True,
+                'cookiefile': 'cookies.txt',
             }
             
             await progress_msg.edit(
