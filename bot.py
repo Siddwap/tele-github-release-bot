@@ -1270,6 +1270,7 @@ class TelegramBot:
                 'no_warnings': True,
                 'extract_flat': False,
                 'cookiefile': 'cookies.txt',
+                'listformats': True,
             }
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -1281,26 +1282,37 @@ class TelegramBot:
                 title = info.get('title', 'video')
                 formats = info.get('formats', [])
                 
-                # Group formats by quality
+                # Create quality options with proper format selection
                 quality_map = {}
-                for fmt in formats:
-                    if fmt.get('vcodec') != 'none' and fmt.get('acodec') != 'none':  # Has both video and audio
-                        height = fmt.get('height')
-                        if height:
-                            quality = f"{height}p"
-                            if quality not in quality_map:
-                                quality_map[quality] = fmt['format_id']
                 
-                # Sort qualities by resolution
+                # Find video formats with height info
+                for fmt in formats:
+                    if fmt.get('vcodec') != 'none':  # Has video
+                        height = fmt.get('height')
+                        if height and height >= 144:  # Minimum 144p
+                            quality_key = f"{height}p"
+                            # Store the best format for this resolution
+                            if quality_key not in quality_map or \
+                               (fmt.get('fps', 0) >= quality_map[quality_key].get('fps', 0) and \
+                                fmt.get('tbr', 0) >= quality_map[quality_key].get('tbr', 0)):
+                                quality_map[quality_key] = {
+                                    'height': height,
+                                    'format_id': fmt['format_id'],
+                                    'ext': fmt.get('ext', 'mp4'),
+                                    'fps': fmt.get('fps', 30),
+                                    'tbr': fmt.get('tbr', 0)
+                                }
+                
+                # Sort qualities by resolution (descending)
                 sorted_qualities = sorted(
                     quality_map.items(),
-                    key=lambda x: int(x[0].replace('p', '')),
+                    key=lambda x: x[1]['height'],
                     reverse=True
                 )
                 
                 return {
                     'title': title,
-                    'qualities': sorted_qualities,
+                    'qualities': [(q, info['format_id']) for q, info in sorted_qualities],
                     'url': url
                 }
         except Exception as e:
@@ -1345,14 +1357,26 @@ class TelegramBot:
                         f"⏳ **Processing and uploading...**"
                     ))
             
+            # Extract height from quality (e.g., "1080p" -> "1080")
+            height = quality.replace('p', '')
+            
+            # Use proper yt-dlp format selection that merges video+audio
+            # This format string tells yt-dlp to:
+            # 1. Select best video with height <= specified quality
+            # 2. Select best audio
+            # 3. Merge them together
             ydl_opts = {
-                'format': f'bestvideo[height<={quality.replace("p", "")}]+bestaudio/best[height<={quality.replace("p", "")}]',
+                'format': f'bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<={height}]+bestaudio/best[height<={height}]/best',
                 'outtmpl': temp_file.name,
                 'merge_output_format': 'mp4',
                 'progress_hooks': [progress_hook],
                 'quiet': True,
                 'no_warnings': True,
                 'cookiefile': 'cookies.txt',
+                'postprocessors': [{
+                    'key': 'FFmpegVideoConvertor',
+                    'preferedformat': 'mp4',
+                }],
             }
             
             await progress_msg.edit(
