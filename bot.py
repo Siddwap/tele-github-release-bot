@@ -1263,94 +1263,88 @@ class TelegramBot:
         return False
     
     async def get_youtube_formats(self, url: str) -> Dict:
-        """Get available formats for YouTube video"""
+        """Get available formats for YouTube video - Simplified approach"""
         try:
             ydl_opts = {
                 'quiet': True,
                 'no_warnings': True,
                 'extract_flat': False,
                 'cookiefile': 'cookies.txt',
+                'skip_download': True,
             }
+            
+            logger.info(f"Fetching YouTube info for: {url}")
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = await asyncio.get_event_loop().run_in_executor(
                     None, lambda: ydl.extract_info(url, download=False)
                 )
                 
-                # Extract video title and available formats
+                if not info:
+                    logger.error("No info returned from yt-dlp")
+                    return None
+                
                 title = info.get('title', 'video')
+                duration = info.get('duration', 0)
                 formats = info.get('formats', [])
                 
-                # Create quality options - filter out storyboards and non-video formats
-                quality_map = {}
+                logger.info(f"Video title: {title}")
+                logger.info(f"Total formats available: {len(formats)}")
                 
+                # Find available video heights
+                available_heights = set()
                 for fmt in formats:
-                    format_id = fmt.get('format_id', '')
-                    ext = fmt.get('ext', '')
-                    vcodec = fmt.get('vcodec', 'none')
                     height = fmt.get('height')
+                    vcodec = fmt.get('vcodec', 'none')
+                    ext = fmt.get('ext', '')
+                    format_id = fmt.get('format_id', '')
                     
-                    # Skip storyboards, thumbnails, and non-video formats
-                    if any([
-                        'sb' in format_id and 'mhtml' in ext,  # storyboard
-                        vcodec == 'none',  # audio only
-                        not height,  # no height info
-                        height < 144,  # too low quality
-                        ext in ['mhtml', '3gp'],  # unsupported formats
-                    ]):
-                        continue
-                    
-                    quality_key = f"{height}p"
-                    
-                    # Get filesize for comparison (prefer smaller files if same quality)
-                    filesize = fmt.get('filesize') or fmt.get('filesize_approx') or 0
-                    
-                    # Store the best format for this resolution
-                    # Prefer formats with both video and audio (acodec != 'none')
-                    has_audio = fmt.get('acodec', 'none') != 'none'
-                    
-                    if quality_key not in quality_map:
-                        quality_map[quality_key] = {
-                            'height': height,
-                            'format_id': format_id,
-                            'ext': ext,
-                            'filesize': filesize,
-                            'has_audio': has_audio,
-                            'vcodec': vcodec,
-                        }
-                    else:
-                        # Prefer formats with audio, or higher bitrate
-                        existing = quality_map[quality_key]
-                        if (has_audio and not existing['has_audio']) or \
-                           (has_audio == existing['has_audio'] and 
-                            fmt.get('tbr', 0) > existing.get('tbr', 0)):
-                            quality_map[quality_key] = {
-                                'height': height,
-                                'format_id': format_id,
-                                'ext': ext,
-                                'filesize': filesize,
-                                'has_audio': has_audio,
-                                'vcodec': vcodec,
-                            }
+                    # Only consider actual video formats (not audio, not storyboards)
+                    if height and vcodec != 'none' and ext not in ['mhtml', '3gp'] and 'sb' not in format_id:
+                        available_heights.add(height)
+                        logger.info(f"Found format: {format_id} - {height}p - {ext} - vcodec: {vcodec}")
                 
-                # Sort qualities by resolution (descending)
-                sorted_qualities = sorted(
-                    quality_map.items(),
-                    key=lambda x: x[1]['height'],
-                    reverse=True
-                )
+                logger.info(f"Available heights: {sorted(available_heights, reverse=True)}")
+                
+                # Define standard qualities to offer
+                standard_qualities = [
+                    ('2160p', 2160),
+                    ('1440p', 1440),
+                    ('1080p', 1080),
+                    ('720p', 720),
+                    ('480p', 480),
+                    ('360p', 360),
+                    ('240p', 240),
+                ]
+                
+                # Only offer qualities that are available
+                qualities = []
+                for quality_name, height in standard_qualities:
+                    # Check if this height or any height close to it is available
+                    if any(abs(h - height) <= 10 for h in available_heights):
+                        qualities.append(quality_name)
+                        logger.info(f"Offering quality: {quality_name}")
+                
+                if not qualities:
+                    logger.error("No suitable qualities found")
+                    # Fallback: offer "best" quality
+                    qualities = ['best']
                 
                 return {
                     'title': title,
-                    'qualities': [(q, info['format_id']) for q, info in sorted_qualities],
+                    'duration': duration,
+                    'qualities': qualities,
                     'url': url
                 }
+                
         except Exception as e:
             logger.error(f"Error getting YouTube formats: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return None
     
     async def download_youtube_video(self, url: str, quality: str, progress_msg, filename: str) -> Optional[str]:
-        """Download YouTube video with specified quality"""
+        """Download YouTube video with specified quality - Simplified approach"""
         temp_file = None
         try:
             # Create temporary file
@@ -1387,21 +1381,37 @@ class TelegramBot:
                         f"⏳ **Processing and uploading...**"
                     ))
             
-            # Extract height from quality (e.g., "1080p" -> "1080")
-            height = quality.replace('p', '')
+            logger.info(f"Downloading YouTube video: {url} with quality: {quality}")
             
-            # Use proper yt-dlp format selection that merges video+audio
-            # This format string tells yt-dlp to:
-            # 1. Select best video with height <= specified quality
-            # 2. Select best audio
-            # 3. Merge them together
+            # Build format selection string
+            if quality == 'best':
+                # Just download the best quality available
+                format_string = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best'
+            else:
+                # Extract height from quality (e.g., "1080p" -> "1080")
+                height = quality.replace('p', '')
+                
+                # Use yt-dlp format selection with fallbacks:
+                # 1. Try to get video at exact height + audio, merge to mp4
+                # 2. Fall back to any video at that height + audio
+                # 3. Fall back to best video at or below that height + audio
+                # 4. Fall back to just best at that height
+                format_string = (
+                    f'bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/'
+                    f'bestvideo[height<={height}]+bestaudio/'
+                    f'best[height<={height}]/'
+                    f'best'
+                )
+            
+            logger.info(f"Using format string: {format_string}")
+            
             ydl_opts = {
-                'format': f'bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<={height}]+bestaudio/best[height<={height}]/best',
+                'format': format_string,
                 'outtmpl': temp_file.name,
                 'merge_output_format': 'mp4',
                 'progress_hooks': [progress_hook],
-                'quiet': True,
-                'no_warnings': True,
+                'quiet': False,  # Enable output for debugging
+                'no_warnings': False,
                 'cookiefile': 'cookies.txt',
                 'postprocessors': [{
                     'key': 'FFmpegVideoConvertor',
@@ -1421,10 +1431,13 @@ class TelegramBot:
                     None, lambda: ydl.download([url])
                 )
             
+            logger.info(f"YouTube download completed: {temp_file.name}")
             return temp_file.name
             
         except Exception as e:
             logger.error(f"Error downloading YouTube video: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             if temp_file and os.path.exists(temp_file.name):
                 try:
                     os.unlink(temp_file.name)
@@ -1583,6 +1596,7 @@ class TelegramBot:
             
             title = youtube_info['title']
             qualities = youtube_info['qualities']
+            duration = youtube_info.get('duration', 0)
             
             if not qualities:
                 await progress_msg.edit(
@@ -1597,7 +1611,7 @@ class TelegramBot:
             # Create quality buttons (max 2 per row)
             buttons = []
             current_row = []
-            for quality, format_id in qualities[:8]:  # Limit to 8 qualities
+            for quality in qualities[:8]:  # Limit to 8 qualities
                 current_row.append(Button.inline(f"📺 {quality}", f"yt_quality_{quality}"))
                 if len(current_row) == 2:
                     buttons.append(current_row)
