@@ -1270,7 +1270,6 @@ class TelegramBot:
                 'no_warnings': True,
                 'extract_flat': False,
                 'cookiefile': 'cookies.txt',
-                'listformats': True,
             }
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -1282,26 +1281,57 @@ class TelegramBot:
                 title = info.get('title', 'video')
                 formats = info.get('formats', [])
                 
-                # Create quality options with proper format selection
+                # Create quality options - filter out storyboards and non-video formats
                 quality_map = {}
                 
-                # Find video formats with height info
                 for fmt in formats:
-                    if fmt.get('vcodec') != 'none':  # Has video
-                        height = fmt.get('height')
-                        if height and height >= 144:  # Minimum 144p
-                            quality_key = f"{height}p"
-                            # Store the best format for this resolution
-                            if quality_key not in quality_map or \
-                               (fmt.get('fps', 0) >= quality_map[quality_key].get('fps', 0) and \
-                                fmt.get('tbr', 0) >= quality_map[quality_key].get('tbr', 0)):
-                                quality_map[quality_key] = {
-                                    'height': height,
-                                    'format_id': fmt['format_id'],
-                                    'ext': fmt.get('ext', 'mp4'),
-                                    'fps': fmt.get('fps', 30),
-                                    'tbr': fmt.get('tbr', 0)
-                                }
+                    format_id = fmt.get('format_id', '')
+                    ext = fmt.get('ext', '')
+                    vcodec = fmt.get('vcodec', 'none')
+                    height = fmt.get('height')
+                    
+                    # Skip storyboards, thumbnails, and non-video formats
+                    if any([
+                        'sb' in format_id and 'mhtml' in ext,  # storyboard
+                        vcodec == 'none',  # audio only
+                        not height,  # no height info
+                        height < 144,  # too low quality
+                        ext in ['mhtml', '3gp'],  # unsupported formats
+                    ]):
+                        continue
+                    
+                    quality_key = f"{height}p"
+                    
+                    # Get filesize for comparison (prefer smaller files if same quality)
+                    filesize = fmt.get('filesize') or fmt.get('filesize_approx') or 0
+                    
+                    # Store the best format for this resolution
+                    # Prefer formats with both video and audio (acodec != 'none')
+                    has_audio = fmt.get('acodec', 'none') != 'none'
+                    
+                    if quality_key not in quality_map:
+                        quality_map[quality_key] = {
+                            'height': height,
+                            'format_id': format_id,
+                            'ext': ext,
+                            'filesize': filesize,
+                            'has_audio': has_audio,
+                            'vcodec': vcodec,
+                        }
+                    else:
+                        # Prefer formats with audio, or higher bitrate
+                        existing = quality_map[quality_key]
+                        if (has_audio and not existing['has_audio']) or \
+                           (has_audio == existing['has_audio'] and 
+                            fmt.get('tbr', 0) > existing.get('tbr', 0)):
+                            quality_map[quality_key] = {
+                                'height': height,
+                                'format_id': format_id,
+                                'ext': ext,
+                                'filesize': filesize,
+                                'has_audio': has_audio,
+                                'vcodec': vcodec,
+                            }
                 
                 # Sort qualities by resolution (descending)
                 sorted_qualities = sorted(
