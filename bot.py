@@ -1299,11 +1299,18 @@ class TelegramBot:
                 f"⏳ Please wait..."
             )
             
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Accept': '*/*',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Range': 'bytes=0-'
+            }
+            
             timeout = aiohttp.ClientTimeout(total=None, connect=30)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
                 # Download video stream
                 async with session.get(video_url) as response:
-                    if response.status != 200:
+                    if response.status not in [200, 206]:
                         raise Exception(f"Failed to download video: HTTP {response.status}")
                     
                     with open(video_temp.name, 'wb') as f:
@@ -1318,7 +1325,7 @@ class TelegramBot:
                 
                 # Download audio stream
                 async with session.get(audio_url) as response:
-                    if response.status != 200:
+                    if response.status not in [200, 206]:
                         raise Exception(f"Failed to download audio: HTTP {response.status}")
                     
                     with open(audio_temp.name, 'wb') as f:
@@ -1388,13 +1395,51 @@ class TelegramBot:
                 f"⏳ **Status:** Starting download..."
             )
             
-            # Download and merge video
-            merged_file_path = await self.download_and_merge_youtube(
-                selected_format['video_url'],
-                selected_format['audio_url'],
-                filename,
-                progress_msg
-            )
+            # Check if video has separate audio/video or already merged
+            has_separate_audio = selected_format.get('separate', True) and selected_format.get('audio_url')
+            
+            if has_separate_audio:
+                # Download and merge video and audio
+                merged_file_path = await self.download_and_merge_youtube(
+                    selected_format['video_url'],
+                    selected_format['audio_url'],
+                    filename,
+                    progress_msg
+                )
+            else:
+                # Direct download for already merged video (like 360p)
+                await progress_msg.edit(
+                    f"📥 **Downloading video...**\n"
+                    f"📁 **File:** `{filename}`\n"
+                    f"⏳ Please wait..."
+                )
+                
+                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+                temp_file.close()
+                
+                try:
+                    headers = {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                        'Accept': '*/*',
+                        'Accept-Language': 'en-US,en;q=0.9',
+                        'Range': 'bytes=0-'
+                    }
+                    
+                    timeout = aiohttp.ClientTimeout(total=None, connect=30)
+                    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                        async with session.get(selected_format['video_url']) as response:
+                            if response.status not in [200, 206]:
+                                raise Exception(f"Failed to download video: HTTP {response.status}")
+                            
+                            with open(temp_file.name, 'wb') as f:
+                                async for chunk in response.content.iter_chunked(1024 * 1024):
+                                    f.write(chunk)
+                    
+                    merged_file_path = temp_file.name
+                except Exception as e:
+                    if os.path.exists(temp_file.name):
+                        os.unlink(temp_file.name)
+                    raise e
             
             # Get file size
             file_size = os.path.getsize(merged_file_path)
