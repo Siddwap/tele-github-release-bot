@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Optional, BinaryIO, Dict, List
 from collections import deque
 import aiohttp
+import yt_dlp
 from telethon import TelegramClient, events
 from telethon.tl.types import DocumentAttributeFilename
 from telethon.tl.custom import Button
