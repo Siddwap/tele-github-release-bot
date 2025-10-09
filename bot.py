@@ -1304,6 +1304,7 @@ class TelegramBot:
                 'quiet': True,
                 'no_warnings': True,
                 'nocheckcertificate': True,
+                'cookiefile': 'cookies.txt',  # Use cookies for authentication
                 'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 'http_headers': {
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
