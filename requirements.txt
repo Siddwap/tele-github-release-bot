@@ -1,9 +1,8 @@
-
-Flask==3.0.0
-gunicorn==21.2.0
-telethon==1.34.0
-aiohttp==3.9.1
-python-dotenv==1.0.0
-PyGithub==2.1.1
-requests==2.31.0
-yt_dlp
+Flask==3.1.1  # Update to latest stable version
+gunicorn==23.0.0  # Update to latest stable version
+telethon==1.36.0  # Update to latest stable version
+aiohttp==3.10.10  # Update to latest stable version
+python-dotenv==1.0.1  # Minor update
+PyGithub==2.4.0  # Update to latest stable version
+requests==2.32.3  # Update to latest stable version
+yt-dlp==2025.10.22  # Pin to latest stable version as of October 2025
