@@ -1294,17 +1294,18 @@ class TelegramBot:
             )
             
             # Configure yt-dlp to download with specified quality
-            # Use format selection to get the best video+audio at desired quality
             format_selector = f'bestvideo[height<={quality}]+bestaudio/best[height<={quality}]'
             
             ydl_opts = {
                 'format': format_selector,
                 'outtmpl': output_temp.name,
                 'merge_output_format': 'mp4',
-                'quiet': True,
-                'no_warnings': True,
+                'quiet': False,  # Enable output for debugging
+                'no_warnings': False,  # Show warnings
+                'verbose': True,  # Enable verbose logging
                 'nocheckcertificate': True,
-                'cookiefile': 'cookies.txt',  # Use cookies for authentication
+                'cookiefile': 'cookies.txt',
+                'extractor_args': {'youtube': {'player_client': ['android', 'web']}},  # Try multiple clients
                 'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 'http_headers': {
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -1315,14 +1316,27 @@ class TelegramBot:
                 },
             }
             
-            logger.info(f"Downloading YouTube video: {youtube_url} with quality {quality}p")
+            logger.info(f"Starting YouTube download: {youtube_url} with quality {quality}p")
+            logger.info(f"Output path: {output_temp.name}")
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([youtube_url])
+                info = ydl.extract_info(youtube_url, download=True)
+                logger.info(f"Download info extracted: {info.get('title', 'Unknown')}")
+            
+            # Verify file exists and has content
+            if not os.path.exists(output_temp.name):
+                raise Exception(f"Downloaded file not found at {output_temp.name}")
+            
+            file_size = os.path.getsize(output_temp.name)
+            logger.info(f"Downloaded file size: {file_size} bytes")
+            
+            if file_size == 0:
+                raise Exception(f"Downloaded file is empty (0 bytes). Check cookies.txt and try again.")
             
             await progress_msg.edit(
                 f"✅ **Download complete!**\n"
                 f"📁 **File:** `{filename}`\n"
+                f"📊 **Size:** {self.format_size(file_size)}\n"
                 f"📊 **Quality:** {quality}p\n"
                 f"⏳ Preparing for upload..."
             )
