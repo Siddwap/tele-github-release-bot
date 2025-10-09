@@ -1277,111 +1277,72 @@ class TelegramBot:
             logger.error(f"Error merging video and audio: {e}")
             return False
     
-    async def download_and_merge_youtube(self, video_url: str, audio_url: str, filename: str, progress_msg) -> Optional[str]:
-        """Download video and audio, then merge them"""
-        video_temp = None
-        audio_temp = None
+    async def download_youtube_with_ytdlp(self, youtube_url: str, quality: int, filename: str, progress_msg) -> Optional[str]:
+        """Download YouTube video using yt-dlp with quality selection"""
         output_temp = None
         
         try:
-            # Create temporary files
-            video_temp = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-            audio_temp = tempfile.NamedTemporaryFile(delete=False, suffix='.m4a')
+            # Create temporary file for output
             output_temp = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-            
-            video_temp.close()
-            audio_temp.close()
             output_temp.close()
             
-            # Download video
             await progress_msg.edit(
-                f"📥 **Downloading video...**\n"
+                f"📥 **Downloading video from YouTube...**\n"
                 f"📁 **File:** `{filename}`\n"
+                f"📊 **Quality:** {quality}p\n"
                 f"⏳ Please wait..."
             )
             
-            # Use yt-dlp to download video (better handling of Google Video URLs)
-            ydl_opts_video = {
-                'format': 'bestvideo',
-                'outtmpl': video_temp.name,
+            # Configure yt-dlp to download with specified quality
+            # Use format selection to get the best video+audio at desired quality
+            format_selector = f'bestvideo[height<={quality}]+bestaudio/best[height<={quality}]'
+            
+            ydl_opts = {
+                'format': format_selector,
+                'outtmpl': output_temp.name,
+                'merge_output_format': 'mp4',
                 'quiet': True,
                 'no_warnings': True,
                 'nocheckcertificate': True,
-                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'http_headers': {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.5',
+                    'Accept-Encoding': 'gzip, deflate',
+                    'Connection': 'keep-alive',
+                },
             }
             
-            with yt_dlp.YoutubeDL(ydl_opts_video) as ydl:
-                ydl.download([video_url])
+            logger.info(f"Downloading YouTube video: {youtube_url} with quality {quality}p")
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([youtube_url])
             
             await progress_msg.edit(
-                f"📥 **Downloading audio...**\n"
+                f"✅ **Download complete!**\n"
                 f"📁 **File:** `{filename}`\n"
-                f"⏳ Please wait..."
+                f"📊 **Quality:** {quality}p\n"
+                f"⏳ Preparing for upload..."
             )
-            
-            # Use yt-dlp to download audio
-            ydl_opts_audio = {
-                'format': 'bestaudio',
-                'outtmpl': audio_temp.name,
-                'quiet': True,
-                'no_warnings': True,
-                'nocheckcertificate': True,
-                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            }
-            
-            with yt_dlp.YoutubeDL(ydl_opts_audio) as ydl:
-                ydl.download([audio_url])
-            
-            # Merge video and audio
-            success = await self.merge_video_audio_ffmpeg(
-                video_temp.name,
-                audio_temp.name,
-                output_temp.name,
-                progress_msg
-            )
-            
-            if not success:
-                raise Exception("Failed to merge video and audio")
             
             return output_temp.name
             
         except Exception as e:
-            logger.error(f"Error in download_and_merge_youtube: {e}")
-            # Clean up temp files on error
-            for temp_file in [video_temp, audio_temp, output_temp]:
-                if temp_file and os.path.exists(temp_file.name):
-                    try:
-                        os.unlink(temp_file.name)
-                    except:
-                        pass
+            logger.error(f"Error downloading YouTube video: {e}")
+            # Clean up temp file on error
+            if output_temp and os.path.exists(output_temp.name):
+                try:
+                    os.unlink(output_temp.name)
+                except:
+                    pass
             raise e
-        finally:
-            # Clean up video and audio temp files (keep output for upload)
-            for temp_file in [video_temp, audio_temp]:
-                if temp_file and os.path.exists(temp_file.name):
-                    try:
-                        os.unlink(temp_file.name)
-                    except:
-                        pass
     
     async def process_youtube_upload(self, event, youtube_url: str, quality: int, video_data: Dict):
         """Process YouTube video download and upload"""
         user_id = event.sender_id
         
         try:
-            # Find the selected quality format
-            formats = video_data['medias'][0]['formats']
-            selected_format = None
-            
-            for fmt in formats:
-                if fmt['quality'] == quality:
-                    selected_format = fmt
-                    break
-            
-            if not selected_format:
-                await event.respond("❌ **Selected quality not found**")
-                return
-            
             # Generate filename
             title = video_data.get('text', 'YouTube Video')
             # Sanitize title for filename
@@ -1395,47 +1356,13 @@ class TelegramBot:
                 f"⏳ **Status:** Starting download..."
             )
             
-            # Check if video has separate audio/video or already merged
-            has_separate_audio = selected_format.get('separate', True) and selected_format.get('audio_url')
-            
-            if has_separate_audio:
-                # Download and merge video and audio
-                merged_file_path = await self.download_and_merge_youtube(
-                    selected_format['video_url'],
-                    selected_format['audio_url'],
-                    filename,
-                    progress_msg
-                )
-            else:
-                # Direct download for already merged video (like 360p)
-                await progress_msg.edit(
-                    f"📥 **Downloading video...**\n"
-                    f"📁 **File:** `{filename}`\n"
-                    f"⏳ Please wait..."
-                )
-                
-                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-                temp_file.close()
-                
-                try:
-                    # Use yt-dlp to download merged video (better handling of Google Video URLs)
-                    ydl_opts = {
-                        'format': 'best',
-                        'outtmpl': temp_file.name,
-                        'quiet': True,
-                        'no_warnings': True,
-                        'nocheckcertificate': True,
-                        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                    }
-                    
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        ydl.download([selected_format['video_url']])
-                    
-                    merged_file_path = temp_file.name
-                except Exception as e:
-                    if os.path.exists(temp_file.name):
-                        os.unlink(temp_file.name)
-                    raise e
+            # Use yt-dlp with original YouTube URL (handles auth and merging automatically)
+            merged_file_path = await self.download_youtube_with_ytdlp(
+                youtube_url,
+                quality,
+                filename,
+                progress_msg
+            )
             
             # Get file size
             file_size = os.path.getsize(merged_file_path)
