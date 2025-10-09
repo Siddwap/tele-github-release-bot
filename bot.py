@@ -1299,38 +1299,37 @@ class TelegramBot:
                 f"⏳ Please wait..."
             )
             
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                'Accept': '*/*',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Range': 'bytes=0-'
+            # Use yt-dlp to download video (better handling of Google Video URLs)
+            ydl_opts_video = {
+                'format': 'bestvideo',
+                'outtmpl': video_temp.name,
+                'quiet': True,
+                'no_warnings': True,
+                'nocheckcertificate': True,
+                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             }
             
-            timeout = aiohttp.ClientTimeout(total=None, connect=30)
-            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-                # Download video stream
-                async with session.get(video_url) as response:
-                    if response.status not in [200, 206]:
-                        raise Exception(f"Failed to download video: HTTP {response.status}")
-                    
-                    with open(video_temp.name, 'wb') as f:
-                        async for chunk in response.content.iter_chunked(1024 * 1024):
-                            f.write(chunk)
-                
-                await progress_msg.edit(
-                    f"📥 **Downloading audio...**\n"
-                    f"📁 **File:** `{filename}`\n"
-                    f"⏳ Please wait..."
-                )
-                
-                # Download audio stream
-                async with session.get(audio_url) as response:
-                    if response.status not in [200, 206]:
-                        raise Exception(f"Failed to download audio: HTTP {response.status}")
-                    
-                    with open(audio_temp.name, 'wb') as f:
-                        async for chunk in response.content.iter_chunked(1024 * 1024):
-                            f.write(chunk)
+            with yt_dlp.YoutubeDL(ydl_opts_video) as ydl:
+                ydl.download([video_url])
+            
+            await progress_msg.edit(
+                f"📥 **Downloading audio...**\n"
+                f"📁 **File:** `{filename}`\n"
+                f"⏳ Please wait..."
+            )
+            
+            # Use yt-dlp to download audio
+            ydl_opts_audio = {
+                'format': 'bestaudio',
+                'outtmpl': audio_temp.name,
+                'quiet': True,
+                'no_warnings': True,
+                'nocheckcertificate': True,
+                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            }
+            
+            with yt_dlp.YoutubeDL(ydl_opts_audio) as ydl:
+                ydl.download([audio_url])
             
             # Merge video and audio
             success = await self.merge_video_audio_ffmpeg(
@@ -1418,22 +1417,18 @@ class TelegramBot:
                 temp_file.close()
                 
                 try:
-                    headers = {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                        'Accept': '*/*',
-                        'Accept-Language': 'en-US,en;q=0.9',
-                        'Range': 'bytes=0-'
+                    # Use yt-dlp to download merged video (better handling of Google Video URLs)
+                    ydl_opts = {
+                        'format': 'best',
+                        'outtmpl': temp_file.name,
+                        'quiet': True,
+                        'no_warnings': True,
+                        'nocheckcertificate': True,
+                        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                     }
                     
-                    timeout = aiohttp.ClientTimeout(total=None, connect=30)
-                    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-                        async with session.get(selected_format['video_url']) as response:
-                            if response.status not in [200, 206]:
-                                raise Exception(f"Failed to download video: HTTP {response.status}")
-                            
-                            with open(temp_file.name, 'wb') as f:
-                                async for chunk in response.content.iter_chunked(1024 * 1024):
-                                    f.write(chunk)
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        ydl.download([selected_format['video_url']])
                     
                     merged_file_path = temp_file.name
                 except Exception as e:
