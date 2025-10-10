@@ -1278,7 +1278,7 @@ class TelegramBot:
             return False
     
     async def download_youtube_with_ytdlp(self, youtube_url: str, quality: int, filename: str, progress_msg) -> Optional[str]:
-        """Download YouTube video using yt-dlp with quality selection"""
+        """Download YouTube video using yt-dlp with quality selection and multiple fallback methods"""
         output_temp = None
         
         try:
@@ -1293,45 +1293,107 @@ class TelegramBot:
                 f"⏳ Please wait..."
             )
             
-            # Configure yt-dlp to download with specified quality
-            format_selector = f'bestvideo[height<={quality}]+bestaudio/best[height<={quality}]'
+            # Check if cookies file exists
+            cookies_path = 'cookies.txt'
+            if not os.path.exists(cookies_path):
+                logger.warning(f"Cookies file not found at {cookies_path}")
+                cookies_path = None
+            else:
+                logger.info(f"Using cookies from {cookies_path}")
             
-            ydl_opts = {
-                'format': format_selector,
-                'outtmpl': output_temp.name,
-                'merge_output_format': 'mp4',
-                'quiet': False,  # Enable output for debugging
-                'no_warnings': False,  # Show warnings
-                'verbose': True,  # Enable verbose logging
-                'nocheckcertificate': True,
-                'cookiefile': 'cookies.txt',
-                'extractor_args': {'youtube': {'player_client': ['android', 'web']}},  # Try multiple clients
-                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'http_headers': {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'Accept-Language': 'en-US,en;q=0.5',
-                    'Accept-Encoding': 'gzip, deflate',
-                    'Connection': 'keep-alive',
-                },
-            }
+            # Try multiple format selections with fallbacks
+            format_options = [
+                f'bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<={quality}][ext=mp4]',  # Best quality MP4
+                f'best[height<={quality}]',  # Single file best quality
+                f'bestvideo[height<={quality}]+bestaudio',  # Any format video + audio
+                'best',  # Absolute fallback
+            ]
             
-            logger.info(f"Starting YouTube download: {youtube_url} with quality {quality}p")
-            logger.info(f"Output path: {output_temp.name}")
+            download_success = False
+            last_error = None
             
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(youtube_url, download=True)
-                logger.info(f"Download info extracted: {info.get('title', 'Unknown')}")
+            for attempt, format_selector in enumerate(format_options, 1):
+                try:
+                    logger.info(f"Attempt {attempt}/{len(format_options)} with format: {format_selector}")
+                    
+                    ydl_opts = {
+                        'format': format_selector,
+                        'outtmpl': output_temp.name,
+                        'merge_output_format': 'mp4',
+                        'quiet': False,
+                        'no_warnings': False,
+                        'nocheckcertificate': True,
+                        'geo_bypass': True,
+                        'age_limit': None,
+                        'extractor_args': {
+                            'youtube': {
+                                'player_client': ['android', 'web', 'ios'],
+                                'skip': ['hls', 'dash']  # Skip these problematic formats
+                            }
+                        },
+                        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                        'http_headers': {
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                            'Accept-Language': 'en-US,en;q=0.9',
+                            'Accept-Encoding': 'gzip, deflate, br',
+                            'Connection': 'keep-alive',
+                            'Upgrade-Insecure-Requests': '1',
+                        },
+                        'socket_timeout': 30,
+                        'retries': 3,
+                    }
+                    
+                    # Add cookies if available
+                    if cookies_path:
+                        ydl_opts['cookiefile'] = cookies_path
+                    
+                    logger.info(f"Starting download attempt {attempt}")
+                    
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        info = ydl.extract_info(youtube_url, download=True)
+                        logger.info(f"Successfully extracted: {info.get('title', 'Unknown')}")
+                    
+                    # Verify file exists and has content
+                    if os.path.exists(output_temp.name):
+                        file_size = os.path.getsize(output_temp.name)
+                        logger.info(f"Downloaded file size: {file_size} bytes")
+                        
+                        if file_size > 0:
+                            download_success = True
+                            logger.info(f"Download successful with format option {attempt}")
+                            break
+                        else:
+                            logger.warning(f"Downloaded file is empty, trying next format...")
+                            os.unlink(output_temp.name)
+                            output_temp = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+                            output_temp.close()
+                    else:
+                        logger.warning(f"Output file not found, trying next format...")
+                        
+                except Exception as e:
+                    last_error = e
+                    logger.error(f"Format option {attempt} failed: {str(e)}")
+                    # Clean up and recreate temp file for next attempt
+                    if os.path.exists(output_temp.name):
+                        try:
+                            os.unlink(output_temp.name)
+                        except:
+                            pass
+                    output_temp = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+                    output_temp.close()
+                    continue
             
-            # Verify file exists and has content
-            if not os.path.exists(output_temp.name):
-                raise Exception(f"Downloaded file not found at {output_temp.name}")
+            if not download_success:
+                error_msg = f"All download attempts failed. Last error: {str(last_error)}"
+                if not cookies_path:
+                    error_msg += "\n\nNote: cookies.txt file not found. Please ensure it exists in the root directory."
+                raise Exception(error_msg)
             
+            # Final verification
             file_size = os.path.getsize(output_temp.name)
-            logger.info(f"Downloaded file size: {file_size} bytes")
-            
             if file_size == 0:
-                raise Exception(f"Downloaded file is empty (0 bytes). Check cookies.txt and try again.")
+                raise Exception("Downloaded file is empty (0 bytes)")
             
             await progress_msg.edit(
                 f"✅ **Download complete!**\n"
