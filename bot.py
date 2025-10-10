@@ -1278,7 +1278,7 @@ class TelegramBot:
             return False
     
     async def download_youtube_with_ytdlp(self, youtube_url: str, quality: int, filename: str, progress_msg) -> Optional[str]:
-        """Download YouTube video using yt-dlp with quality selection and multiple fallback methods"""
+        """Download YouTube video using yt-dlp - Simple and reliable method"""
         output_temp = None
         
         try:
@@ -1295,108 +1295,60 @@ class TelegramBot:
             
             # Check if cookies file exists
             cookies_path = 'cookies.txt'
-            if not os.path.exists(cookies_path):
-                logger.warning(f"Cookies file not found at {cookies_path}")
-                cookies_path = None
-            else:
+            has_cookies = os.path.exists(cookies_path)
+            
+            if has_cookies:
                 logger.info(f"Using cookies from {cookies_path}")
+            else:
+                logger.info("No cookies file found, downloading without authentication")
             
-            # Try multiple client options that don't require PO Tokens
-            # Reference: https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide
-            client_configs = [
-                {
-                    'name': 'android_vr',
-                    'clients': ['android_vr'],
-                    'format': f'best[height<={quality}]/best'
+            # Simple, reliable yt-dlp configuration
+            # Let yt-dlp handle format selection with its defaults
+            ydl_opts = {
+                # Simple format selection - let yt-dlp choose the best available
+                'format': f'bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<={quality}][ext=mp4]/best[height<={quality}]/best',
+                'outtmpl': output_temp.name,
+                'merge_output_format': 'mp4',
+                
+                # Basic settings
+                'quiet': False,
+                'no_warnings': False,
+                'ignoreerrors': False,
+                
+                # Network settings
+                'nocheckcertificate': True,
+                'socket_timeout': 60,
+                'retries': 10,
+                'fragment_retries': 10,
+                
+                # Headers
+                'http_headers': {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'en-us,en;q=0.5',
+                    'Sec-Fetch-Mode': 'navigate',
                 },
-                {
-                    'name': 'tv_embedded',
-                    'clients': ['tv_embedded'],
-                    'format': f'best[height<={quality}]/best'
-                },
-                {
-                    'name': 'tv',
-                    'clients': ['tv'],
-                    'format': f'best[height<={quality}]/best'
-                },
-            ]
+            }
             
-            download_success = False
-            last_error = None
+            # Add cookies if available
+            if has_cookies:
+                ydl_opts['cookiefile'] = cookies_path
             
-            for attempt, config in enumerate(client_configs, 1):
-                try:
-                    logger.info(f"Attempt {attempt}/{len(client_configs)} with client: {config['name']}")
-                    
-                    ydl_opts = {
-                        'format': config['format'],
-                        'outtmpl': output_temp.name,
-                        'merge_output_format': 'mp4',
-                        'quiet': False,
-                        'no_warnings': False,
-                        'nocheckcertificate': True,
-                        'geo_bypass': True,
-                        'extractor_args': {
-                            'youtube': {
-                                'player_client': config['clients'],
-                                'skip': ['hls', 'dash']
-                            }
-                        },
-                        'http_headers': {
-                            'User-Agent': 'com.google.android.youtube/19.29.37 (Linux; U; Android 13) gzip',
-                            'Accept': '*/*',
-                            'Accept-Language': 'en-US,en;q=0.9',
-                        },
-                        'socket_timeout': 60,
-                        'retries': 5,
-                    }
-                    
-                    # Add cookies only for clients that support them
-                    if cookies_path and config['name'] != 'tv_simply':
-                        ydl_opts['cookiefile'] = cookies_path
-                    
-                    logger.info(f"Starting download attempt {attempt} with {config['name']} client")
-                    
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        info = ydl.extract_info(youtube_url, download=True)
-                        logger.info(f"Successfully extracted: {info.get('title', 'Unknown')}")
-                    
-                    # Verify file exists and has content
-                    if os.path.exists(output_temp.name):
-                        file_size = os.path.getsize(output_temp.name)
-                        logger.info(f"Downloaded file size: {file_size} bytes using {config['name']} client")
-                        
-                        if file_size > 0:
-                            download_success = True
-                            logger.info(f"✅ Download successful with {config['name']} client")
-                            break
-                        else:
-                            logger.warning(f"Downloaded file is empty, trying next client...")
-                            os.unlink(output_temp.name)
-                            output_temp = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-                            output_temp.close()
-                    else:
-                        logger.warning(f"Output file not found, trying next client...")
-                        
-                except Exception as e:
-                    last_error = e
-                    logger.error(f"Client {config['name']} failed: {str(e)}")
-                    # Clean up and recreate temp file for next attempt
-                    if os.path.exists(output_temp.name):
-                        try:
-                            os.unlink(output_temp.name)
-                        except:
-                            pass
-                    output_temp = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-                    output_temp.close()
-                    continue
+            logger.info(f"Starting YouTube download with quality: {quality}p")
+            logger.info(f"URL: {youtube_url}")
             
-            if not download_success:
-                error_msg = f"All download attempts failed. Last error: {str(last_error)}"
-                raise Exception(error_msg)
+            # Download with yt-dlp
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(youtube_url, download=True)
+                logger.info(f"Successfully downloaded: {info.get('title', 'Unknown')}")
             
-            # Final verification
+            # Verify file exists and has content
+            if not os.path.exists(output_temp.name):
+                raise Exception("Download failed - output file not created")
+            
             file_size = os.path.getsize(output_temp.name)
+            logger.info(f"Downloaded file size: {self.format_size(file_size)}")
+            
             if file_size == 0:
                 raise Exception("Downloaded file is empty (0 bytes)")
             
