@@ -1301,54 +1301,61 @@ class TelegramBot:
             else:
                 logger.info(f"Using cookies from {cookies_path}")
             
-            # Try multiple format selections with fallbacks
-            format_options = [
-                f'bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<={quality}][ext=mp4]',  # Best quality MP4
-                f'best[height<={quality}]',  # Single file best quality
-                f'bestvideo[height<={quality}]+bestaudio',  # Any format video + audio
-                'best',  # Absolute fallback
+            # Try multiple client options that don't require PO Tokens
+            # Reference: https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide
+            client_configs = [
+                {
+                    'name': 'android_vr',
+                    'clients': ['android_vr'],
+                    'format': f'best[height<={quality}]/best'
+                },
+                {
+                    'name': 'tv_embedded',
+                    'clients': ['tv_embedded'],
+                    'format': f'best[height<={quality}]/best'
+                },
+                {
+                    'name': 'tv',
+                    'clients': ['tv'],
+                    'format': f'best[height<={quality}]/best'
+                },
             ]
             
             download_success = False
             last_error = None
             
-            for attempt, format_selector in enumerate(format_options, 1):
+            for attempt, config in enumerate(client_configs, 1):
                 try:
-                    logger.info(f"Attempt {attempt}/{len(format_options)} with format: {format_selector}")
+                    logger.info(f"Attempt {attempt}/{len(client_configs)} with client: {config['name']}")
                     
                     ydl_opts = {
-                        'format': format_selector,
+                        'format': config['format'],
                         'outtmpl': output_temp.name,
                         'merge_output_format': 'mp4',
                         'quiet': False,
                         'no_warnings': False,
                         'nocheckcertificate': True,
                         'geo_bypass': True,
-                        'age_limit': None,
                         'extractor_args': {
                             'youtube': {
-                                'player_client': ['android', 'web', 'ios'],
-                                'skip': ['hls', 'dash']  # Skip these problematic formats
+                                'player_client': config['clients'],
+                                'skip': ['hls', 'dash']
                             }
                         },
-                        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                         'http_headers': {
-                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                            'User-Agent': 'com.google.android.youtube/19.29.37 (Linux; U; Android 13) gzip',
+                            'Accept': '*/*',
                             'Accept-Language': 'en-US,en;q=0.9',
-                            'Accept-Encoding': 'gzip, deflate, br',
-                            'Connection': 'keep-alive',
-                            'Upgrade-Insecure-Requests': '1',
                         },
-                        'socket_timeout': 30,
-                        'retries': 3,
+                        'socket_timeout': 60,
+                        'retries': 5,
                     }
                     
-                    # Add cookies if available
-                    if cookies_path:
+                    # Add cookies only for clients that support them
+                    if cookies_path and config['name'] != 'tv_simply':
                         ydl_opts['cookiefile'] = cookies_path
                     
-                    logger.info(f"Starting download attempt {attempt}")
+                    logger.info(f"Starting download attempt {attempt} with {config['name']} client")
                     
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                         info = ydl.extract_info(youtube_url, download=True)
@@ -1357,23 +1364,23 @@ class TelegramBot:
                     # Verify file exists and has content
                     if os.path.exists(output_temp.name):
                         file_size = os.path.getsize(output_temp.name)
-                        logger.info(f"Downloaded file size: {file_size} bytes")
+                        logger.info(f"Downloaded file size: {file_size} bytes using {config['name']} client")
                         
                         if file_size > 0:
                             download_success = True
-                            logger.info(f"Download successful with format option {attempt}")
+                            logger.info(f"✅ Download successful with {config['name']} client")
                             break
                         else:
-                            logger.warning(f"Downloaded file is empty, trying next format...")
+                            logger.warning(f"Downloaded file is empty, trying next client...")
                             os.unlink(output_temp.name)
                             output_temp = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
                             output_temp.close()
                     else:
-                        logger.warning(f"Output file not found, trying next format...")
+                        logger.warning(f"Output file not found, trying next client...")
                         
                 except Exception as e:
                     last_error = e
-                    logger.error(f"Format option {attempt} failed: {str(e)}")
+                    logger.error(f"Client {config['name']} failed: {str(e)}")
                     # Clean up and recreate temp file for next attempt
                     if os.path.exists(output_temp.name):
                         try:
@@ -1386,8 +1393,6 @@ class TelegramBot:
             
             if not download_success:
                 error_msg = f"All download attempts failed. Last error: {str(last_error)}"
-                if not cookies_path:
-                    error_msg += "\n\nNote: cookies.txt file not found. Please ensure it exists in the root directory."
                 raise Exception(error_msg)
             
             # Final verification
