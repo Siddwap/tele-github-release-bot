@@ -1297,7 +1297,8 @@ class TelegramBot:
             # WEB client automatically generates PO tokens to bypass bot detection
             yt = YouTube(
                 youtube_url,
-                'WEB',  # Use WEB client for automatic PO token generation
+                client='WEB',  # Use WEB client
+                use_po_token=True,  # This is crucial for bypassing bot detection
                 on_progress_callback=on_progress,
                 use_oauth=False,
                 allow_oauth_cache=False
