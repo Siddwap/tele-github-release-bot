@@ -1279,114 +1279,113 @@ class TelegramBot:
             return False
     
     async def download_youtube_with_pytubefix(self, youtube_url: str, quality: int, filename: str, progress_msg) -> Optional[str]:
-        """Download YouTube video using pytubefix - Currently working method"""
-        output_path = None
+    """Download YouTube video using pytubefix - Fixed version"""
+    output_path = None
+    
+    try:
+        await progress_msg.edit(
+            f"📥 **Downloading video from YouTube...**\n"
+            f"📁 **File:** `{filename}`\n"
+            f"📊 **Quality:** {quality}p\n"
+            f"⏳ Initializing..."
+        )
         
-        try:
-            await progress_msg.edit(
-                f"📥 **Downloading video from YouTube...**\n"
-                f"📁 **File:** `{filename}`\n"
-                f"📊 **Quality:** {quality}p\n"
-                f"⏳ Initializing..."
-            )
-            
-            logger.info(f"Starting YouTube download with quality: {quality}p")
-            logger.info(f"URL: {youtube_url}")
-            
-            # Initialize YouTube object with pytubefix using WEB client
-            # WEB client automatically generates PO tokens to bypass bot detection
-            yt = YouTube(
-                youtube_url,
-                'WEB',  # Use WEB client for automatic PO token generation
-                on_progress_callback=on_progress,
-                use_oauth=False,
-                allow_oauth_cache=False
-            )
-            
-            logger.info(f"Video title: {yt.title}")
-            logger.info(f"Video length: {yt.length} seconds")
-            
-            await progress_msg.edit(
-                f"📥 **Downloading video from YouTube...**\n"
-                f"📁 **File:** `{filename}`\n"
-                f"🎬 **Title:** {yt.title[:50]}...\n"
-                f"📊 **Quality:** {quality}p\n"
-                f"⏳ Selecting best stream..."
-            )
-            
-            # Get progressive stream (already merged video+audio) at desired quality
-            # Progressive streams are simpler and more reliable
-            stream = None
-            
-            # Try to get progressive stream at exact quality
-            stream = yt.streams.filter(progressive=True, file_extension='mp4', res=f'{quality}p').first()
-            
-            # If not available, try adaptive stream (video only) and merge later
-            if not stream:
-                logger.info(f"No progressive stream at {quality}p, trying adaptive...")
-                stream = yt.streams.filter(adaptive=True, file_extension='mp4', res=f'{quality}p').first()
-            
-            # Fallback to highest quality progressive stream
-            if not stream:
-                logger.info(f"No stream at {quality}p, getting highest quality progressive...")
-                stream = yt.streams.filter(progressive=True, file_extension='mp4').order_by('resolution').desc().first()
-            
-            # Last resort: get any mp4 stream
-            if not stream:
-                logger.info("Getting any available mp4 stream...")
-                stream = yt.streams.filter(file_extension='mp4').first()
-            
-            if not stream:
-                raise Exception("No suitable video stream found")
-            
-            logger.info(f"Selected stream: {stream.resolution} - {stream.mime_type} - Progressive: {stream.is_progressive}")
-            
-            await progress_msg.edit(
-                f"📥 **Downloading video from YouTube...**\n"
-                f"📁 **File:** `{filename}`\n"
-                f"🎬 **Title:** {yt.title[:50]}...\n"
-                f"📊 **Quality:** {stream.resolution}\n"
-                f"⏳ Downloading..."
-            )
-            
-            # Create temp directory for download
-            temp_dir = tempfile.mkdtemp()
-            
-            # Download the stream
-            output_path = stream.download(output_path=temp_dir, filename='video.mp4')
-            
-            logger.info(f"Downloaded to: {output_path}")
-            
-            # Verify file exists and has content
-            if not os.path.exists(output_path):
-                raise Exception("Download failed - output file not created")
-            
-            file_size = os.path.getsize(output_path)
-            logger.info(f"Downloaded file size: {self.format_size(file_size)}")
-            
-            if file_size == 0:
-                raise Exception("Downloaded file is empty (0 bytes)")
-            
-            await progress_msg.edit(
-                f"✅ **Download complete!**\n"
-                f"📁 **File:** `{filename}`\n"
-                f"🎬 **Title:** {yt.title[:50]}...\n"
-                f"📊 **Size:** {self.format_size(file_size)}\n"
-                f"📊 **Quality:** {stream.resolution}\n"
-                f"⏳ Preparing for upload..."
-            )
-            
-            return output_path
-            
-        except Exception as e:
-            logger.error(f"Error downloading YouTube video: {e}")
-            # Clean up temp file on error
-            if output_path and os.path.exists(output_path):
-                try:
-                    os.unlink(output_path)
-                except:
-                    pass
-            raise e
+        logger.info(f"Starting YouTube download with quality: {quality}p")
+        logger.info(f"URL: {youtube_url}")
+        
+        # Fixed: Add use_po_token=True to bypass bot detection
+        yt = YouTube(
+            youtube_url,
+            client='WEB',  # Use WEB client
+            use_po_token=True,  # This is crucial for bypassing bot detection
+            on_progress_callback=on_progress,
+            use_oauth=False,
+            allow_oauth_cache=False
+        )
+        
+        logger.info(f"Video title: {yt.title}")
+        logger.info(f"Video length: {yt.length} seconds")
+        
+        await progress_msg.edit(
+            f"📥 **Downloading video from YouTube...**\n"
+            f"📁 **File:** `{filename}`\n"
+            f"🎬 **Title:** {yt.title[:50]}...\n"
+            f"📊 **Quality:** {quality}p\n"
+            f"⏳ Selecting best stream..."
+        )
+        
+        # Get progressive stream (already merged video+audio) at desired quality
+        stream = None
+        
+        # Try to get progressive stream at exact quality
+        stream = yt.streams.filter(progressive=True, file_extension='mp4', res=f'{quality}p').first()
+        
+        # If not available, try adaptive stream (video only) and merge later
+        if not stream:
+            logger.info(f"No progressive stream at {quality}p, trying adaptive...")
+            stream = yt.streams.filter(adaptive=True, file_extension='mp4', res=f'{quality}p').first()
+        
+        # Fallback to highest quality progressive stream
+        if not stream:
+            logger.info(f"No stream at {quality}p, getting highest quality progressive...")
+            stream = yt.streams.filter(progressive=True, file_extension='mp4').order_by('resolution').desc().first()
+        
+        # Last resort: get any mp4 stream
+        if not stream:
+            logger.info("Getting any available mp4 stream...")
+            stream = yt.streams.filter(file_extension='mp4').first()
+        
+        if not stream:
+            raise Exception("No suitable video stream found")
+        
+        logger.info(f"Selected stream: {stream.resolution} - {stream.mime_type} - Progressive: {stream.is_progressive}")
+        
+        await progress_msg.edit(
+            f"📥 **Downloading video from YouTube...**\n"
+            f"📁 **File:** `{filename}`\n"
+            f"🎬 **Title:** {yt.title[:50]}...\n"
+            f"📊 **Quality:** {stream.resolution}\n"
+            f"⏳ Downloading..."
+        )
+        
+        # Create temp directory for download
+        temp_dir = tempfile.mkdtemp()
+        
+        # Download the stream
+        output_path = stream.download(output_path=temp_dir, filename='video.mp4')
+        
+        logger.info(f"Downloaded to: {output_path}")
+        
+        # Verify file exists and has content
+        if not os.path.exists(output_path):
+            raise Exception("Download failed - output file not created")
+        
+        file_size = os.path.getsize(output_path)
+        logger.info(f"Downloaded file size: {self.format_size(file_size)}")
+        
+        if file_size == 0:
+            raise Exception("Downloaded file is empty (0 bytes)")
+        
+        await progress_msg.edit(
+            f"✅ **Download complete!**\n"
+            f"📁 **File:** `{filename}`\n"
+            f"🎬 **Title:** {yt.title[:50]}...\n"
+            f"📊 **Size:** {self.format_size(file_size)}\n"
+            f"📊 **Quality:** {stream.resolution}\n"
+            f"⏳ Preparing for upload..."
+        )
+        
+        return output_path
+        
+    except Exception as e:
+        logger.error(f"Error downloading YouTube video: {e}")
+        # Clean up temp file on error
+        if output_path and os.path.exists(output_path):
+            try:
+                os.unlink(output_path)
+            except:
+                pass
+        raise e
     
     async def process_youtube_upload(self, event, youtube_url: str, quality: int, video_data: Dict):
         """Process YouTube video download and upload"""
