@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 import os
@@ -733,8 +732,6 @@ class TelegramBot:
             )
             raise events.StopPropagation
 
-        # ... keep existing code (all event handlers for help, stop, restart, status, queue, list, search, delete, rename, callbacks, etc.)
-
         @self.client.on(events.NewMessage(pattern='/help'))
         async def help_handler(event):
             user_id = event.sender_id
@@ -859,7 +856,7 @@ class TelegramBot:
                 raise events.StopPropagation
             
             try:
-                await send_file_list(event, page=1)
+                await self.send_file_list(event, page=1)
             except Exception as e:
                 await event.respond(f"❌ **Error listing files**\n\n{str(e)}")
             raise events.StopPropagation
@@ -920,13 +917,13 @@ class TelegramBot:
             
             if data.startswith('list_page_'):
                 page = int(data.split('_')[2])
-                await send_file_list(event, page, edit=True)
+                await self.send_file_list(event, page, edit=True)
                 await event.answer()
             elif data == 'close_list':
                 await event.delete()
                 await event.answer()
 
-        async def send_file_list(event, page=1, edit=False):
+        async def send_file_list(self, event, page=1, edit=False):
             """Send file list with pagination buttons"""
             assets = await self.github_uploader.list_release_assets()
             if not assets:
@@ -985,9 +982,6 @@ class TelegramBot:
                 await event.edit(response, buttons=buttons)
             else:
                 await event.respond(response, buttons=buttons)
-
-        # Store the method in the class for access in callback handler
-        self.send_file_list = send_file_list
 
         @self.client.on(events.NewMessage(pattern=r'/search (.+)'))
         async def search_handler(event):
@@ -1278,7 +1272,7 @@ class TelegramBot:
             logger.error(f"Error merging video and audio: {e}")
             return False
     
-     async def download_youtube_with_pytubefix(self, youtube_url: str, quality: int, filename: str, progress_msg) -> Optional[str]:
+    async def download_youtube_with_pytubefix(self, youtube_url: str, quality: int, filename: str, progress_msg) -> Optional[str]:
         """Download YouTube video using pytubefix - Fixed version"""
         output_path = None
 
@@ -1293,7 +1287,7 @@ class TelegramBot:
             logger.info(f"Starting YouTube download with quality: {quality}p")
             logger.info(f"URL: {youtube_url}")
         
-        # Fixed: Add use_po_token=True to bypass bot detection
+            # Fixed: Add use_po_token=True to bypass bot detection
             yt = YouTube(
                 youtube_url,
                 client='WEB',  # Use WEB client
@@ -1314,23 +1308,23 @@ class TelegramBot:
                 f"⏳ Selecting best stream..."
             )
         
-        # Get progressive stream (already merged video+audio) at desired quality
+            # Get progressive stream (already merged video+audio) at desired quality
             stream = None
         
-        # Try to get progressive stream at exact quality
+            # Try to get progressive stream at exact quality
             stream = yt.streams.filter(progressive=True, file_extension='mp4', res=f'{quality}p').first()
         
-        # If not available, try adaptive stream (video only) and merge later
+            # If not available, try adaptive stream (video only) and merge later
             if not stream:
                 logger.info(f"No progressive stream at {quality}p, trying adaptive...")
                 stream = yt.streams.filter(adaptive=True, file_extension='mp4', res=f'{quality}p').first()
         
-        # Fallback to highest quality progressive stream
+            # Fallback to highest quality progressive stream
             if not stream:
                 logger.info(f"No stream at {quality}p, getting highest quality progressive...")
                 stream = yt.streams.filter(progressive=True, file_extension='mp4').order_by('resolution').desc().first()
         
-        # Last resort: get any mp4 stream
+            # Last resort: get any mp4 stream
             if not stream:
                 logger.info("Getting any available mp4 stream...")
                 stream = yt.streams.filter(file_extension='mp4').first()
@@ -1348,15 +1342,15 @@ class TelegramBot:
                 f"⏳ Downloading..."
             )
         
-        # Create temp directory for download
+            # Create temp directory for download
             temp_dir = tempfile.mkdtemp()
         
-        # Download the stream
+            # Download the stream
             output_path = stream.download(output_path=temp_dir, filename='video.mp4')
         
             logger.info(f"Downloaded to: {output_path}")
         
-        # Verify file exists and has content
+            # Verify file exists and has content
             if not os.path.exists(output_path):
                 raise Exception("Download failed - output file not created")
         
@@ -1379,7 +1373,7 @@ class TelegramBot:
         
         except Exception as e:
             logger.error(f"Error downloading YouTube video: {e}")
-        # Clean up temp file on error
+            # Clean up temp file on error
             if output_path and os.path.exists(output_path):
                 try:
                     os.unlink(output_path)
