@@ -5,4 +5,4 @@ aiohttp==3.10.10  # Update to latest stable version
 python-dotenv==1.0.1  # Minor update
 PyGithub==2.4.0  # Update to latest stable version
 requests==2.32.3  # Update to latest stable version
-yt-dlp==2025.09.26  # Pin to latest stable version as of October 2025
+pytubefix==8.12.3  # Working alternative to yt-dlp for YouTube downloads

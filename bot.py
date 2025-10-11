@@ -7,7 +7,8 @@ from datetime import datetime
 from typing import Optional, BinaryIO, Dict, List
 from collections import deque
 import aiohttp
-import yt_dlp
+from pytubefix import YouTube
+from pytubefix.cli import on_progress
 from telethon import TelegramClient, events
 from telethon.tl.types import DocumentAttributeFilename
 from telethon.tl.custom import Button
@@ -1277,76 +1278,88 @@ class TelegramBot:
             logger.error(f"Error merging video and audio: {e}")
             return False
     
-    async def download_youtube_with_ytdlp(self, youtube_url: str, quality: int, filename: str, progress_msg) -> Optional[str]:
-        """Download YouTube video using yt-dlp - Simple and reliable method"""
-        output_temp = None
+    async def download_youtube_with_pytubefix(self, youtube_url: str, quality: int, filename: str, progress_msg) -> Optional[str]:
+        """Download YouTube video using pytubefix - Currently working method"""
+        output_path = None
         
         try:
-            # Create temporary file for output
-            output_temp = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-            output_temp.close()
-            
             await progress_msg.edit(
                 f"📥 **Downloading video from YouTube...**\n"
                 f"📁 **File:** `{filename}`\n"
                 f"📊 **Quality:** {quality}p\n"
-                f"⏳ Please wait..."
+                f"⏳ Initializing..."
             )
-            
-            # Check if cookies file exists
-            cookies_path = 'cookies.txt'
-            has_cookies = os.path.exists(cookies_path)
-            
-            if has_cookies:
-                logger.info(f"Using cookies from {cookies_path}")
-            else:
-                logger.info("No cookies file found, downloading without authentication")
-            
-            # Simple, reliable yt-dlp configuration
-            # Let yt-dlp handle format selection with its defaults
-            ydl_opts = {
-                # Simple format selection - let yt-dlp choose the best available
-                'format': f'bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<={quality}][ext=mp4]/best[height<={quality}]/best',
-                'outtmpl': output_temp.name,
-                'merge_output_format': 'mp4',
-                
-                # Basic settings
-                'quiet': False,
-                'no_warnings': False,
-                'ignoreerrors': False,
-                
-                # Network settings
-                'nocheckcertificate': True,
-                'socket_timeout': 60,
-                'retries': 10,
-                'fragment_retries': 10,
-                
-                # Headers
-                'http_headers': {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'Accept-Language': 'en-us,en;q=0.5',
-                    'Sec-Fetch-Mode': 'navigate',
-                },
-            }
-            
-            # Add cookies if available
-            if has_cookies:
-                ydl_opts['cookiefile'] = cookies_path
             
             logger.info(f"Starting YouTube download with quality: {quality}p")
             logger.info(f"URL: {youtube_url}")
             
-            # Download with yt-dlp
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(youtube_url, download=True)
-                logger.info(f"Successfully downloaded: {info.get('title', 'Unknown')}")
+            # Initialize YouTube object with pytubefix
+            yt = YouTube(
+                youtube_url,
+                on_progress_callback=on_progress,
+                use_oauth=False,
+                allow_oauth_cache=False
+            )
+            
+            logger.info(f"Video title: {yt.title}")
+            logger.info(f"Video length: {yt.length} seconds")
+            
+            await progress_msg.edit(
+                f"📥 **Downloading video from YouTube...**\n"
+                f"📁 **File:** `{filename}`\n"
+                f"🎬 **Title:** {yt.title[:50]}...\n"
+                f"📊 **Quality:** {quality}p\n"
+                f"⏳ Selecting best stream..."
+            )
+            
+            # Get progressive stream (already merged video+audio) at desired quality
+            # Progressive streams are simpler and more reliable
+            stream = None
+            
+            # Try to get progressive stream at exact quality
+            stream = yt.streams.filter(progressive=True, file_extension='mp4', res=f'{quality}p').first()
+            
+            # If not available, try adaptive stream (video only) and merge later
+            if not stream:
+                logger.info(f"No progressive stream at {quality}p, trying adaptive...")
+                stream = yt.streams.filter(adaptive=True, file_extension='mp4', res=f'{quality}p').first()
+            
+            # Fallback to highest quality progressive stream
+            if not stream:
+                logger.info(f"No stream at {quality}p, getting highest quality progressive...")
+                stream = yt.streams.filter(progressive=True, file_extension='mp4').order_by('resolution').desc().first()
+            
+            # Last resort: get any mp4 stream
+            if not stream:
+                logger.info("Getting any available mp4 stream...")
+                stream = yt.streams.filter(file_extension='mp4').first()
+            
+            if not stream:
+                raise Exception("No suitable video stream found")
+            
+            logger.info(f"Selected stream: {stream.resolution} - {stream.mime_type} - Progressive: {stream.is_progressive}")
+            
+            await progress_msg.edit(
+                f"📥 **Downloading video from YouTube...**\n"
+                f"📁 **File:** `{filename}`\n"
+                f"🎬 **Title:** {yt.title[:50]}...\n"
+                f"📊 **Quality:** {stream.resolution}\n"
+                f"⏳ Downloading..."
+            )
+            
+            # Create temp directory for download
+            temp_dir = tempfile.mkdtemp()
+            
+            # Download the stream
+            output_path = stream.download(output_path=temp_dir, filename='video.mp4')
+            
+            logger.info(f"Downloaded to: {output_path}")
             
             # Verify file exists and has content
-            if not os.path.exists(output_temp.name):
+            if not os.path.exists(output_path):
                 raise Exception("Download failed - output file not created")
             
-            file_size = os.path.getsize(output_temp.name)
+            file_size = os.path.getsize(output_path)
             logger.info(f"Downloaded file size: {self.format_size(file_size)}")
             
             if file_size == 0:
@@ -1355,19 +1368,20 @@ class TelegramBot:
             await progress_msg.edit(
                 f"✅ **Download complete!**\n"
                 f"📁 **File:** `{filename}`\n"
+                f"🎬 **Title:** {yt.title[:50]}...\n"
                 f"📊 **Size:** {self.format_size(file_size)}\n"
-                f"📊 **Quality:** {quality}p\n"
+                f"📊 **Quality:** {stream.resolution}\n"
                 f"⏳ Preparing for upload..."
             )
             
-            return output_temp.name
+            return output_path
             
         except Exception as e:
             logger.error(f"Error downloading YouTube video: {e}")
             # Clean up temp file on error
-            if output_temp and os.path.exists(output_temp.name):
+            if output_path and os.path.exists(output_path):
                 try:
-                    os.unlink(output_temp.name)
+                    os.unlink(output_path)
                 except:
                     pass
             raise e
@@ -1390,8 +1404,8 @@ class TelegramBot:
                 f"⏳ **Status:** Starting download..."
             )
             
-            # Use yt-dlp with original YouTube URL (handles auth and merging automatically)
-            merged_file_path = await self.download_youtube_with_ytdlp(
+            # Use pytubefix for reliable YouTube downloads
+            merged_file_path = await self.download_youtube_with_pytubefix(
                 youtube_url,
                 quality,
                 filename,
