@@ -1278,9 +1278,9 @@ class TelegramBot:
             logger.error(f"Error merging video and audio: {e}")
             return False
     
-    async async def download_youtube_with_pytubefix(self, youtube_url: str, quality: int, filename: str, progress_msg) -> Optional[str]:
+    async def download_youtube_with_pytubefix(self, youtube_url: str, quality: int, filename: str, progress_msg) -> Optional[str]:
         """Download YouTube video using pytubefix - Fixed version"""
-        output_path = None
+         output_path = None
     
         try:
             await progress_msg.edit(
