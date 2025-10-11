@@ -1293,9 +1293,11 @@ class TelegramBot:
             logger.info(f"Starting YouTube download with quality: {quality}p")
             logger.info(f"URL: {youtube_url}")
             
-            # Initialize YouTube object with pytubefix
+            # Initialize YouTube object with pytubefix using WEB client
+            # WEB client automatically generates PO tokens to bypass bot detection
             yt = YouTube(
                 youtube_url,
+                'WEB',  # Use WEB client for automatic PO token generation
                 on_progress_callback=on_progress,
                 use_oauth=False,
                 allow_oauth_cache=False
