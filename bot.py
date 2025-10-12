@@ -1295,14 +1295,18 @@ class TelegramBot:
             
             # Initialize YouTube object with pytubefix using WEB client
             # WEB client automatically generates PO tokens to bypass bot detection
-            yt = YouTube(
-                youtube_url,
-                client='WEB',  # Use WEB client
-                use_po_token=True,  # This is crucial for bypassing bot detection
-                on_progress_callback=on_progress,
-                use_oauth=False,
-                allow_oauth_cache=False
-            )
+            # Correct syntax: client as second positional argument
+            def on_progress(stream, chunk, bytes_remaining):
+                """Progress callback for download"""
+                try:
+                    total_size = stream.filesize
+                    bytes_downloaded = total_size - bytes_remaining
+                    percentage = (bytes_downloaded / total_size) * 100
+                    logger.info(f"Download progress: {percentage:.1f}%")
+                except Exception as e:
+                    logger.error(f"Error in progress callback: {e}")
+            
+            yt = YouTube(youtube_url, 'WEB', on_progress_callback=on_progress)
             
             logger.info(f"Video title: {yt.title}")
             logger.info(f"Video length: {yt.length} seconds")
