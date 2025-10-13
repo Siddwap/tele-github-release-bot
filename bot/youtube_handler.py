@@ -5,7 +5,7 @@ import logging
 import os
 from typing import Dict, Optional
 from telethon.tl.custom import Button
-from bot.download_handlers import fetch_youtube_video_data, download_youtube_with_pytubefix
+from bot.download_handlers import fetch_youtube_video_data, download_youtube_with_ytdlp
 from bot.upload_handlers import upload_to_github_streaming
 
 logger = logging.getLogger(__name__)
@@ -89,7 +89,7 @@ class YouTubeHandler:
                 f"⏳ **Status:** Starting download..."
             )
             
-            merged_file_path = await download_youtube_with_pytubefix(
+            merged_file_path = await download_youtube_with_ytdlp(
                 youtube_url,
                 quality,
                 filename,
