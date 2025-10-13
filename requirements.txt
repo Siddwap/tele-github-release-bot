@@ -6,3 +6,4 @@ python-dotenv==1.0.1  # Minor update
 PyGithub==2.4.0  # Update to latest stable version
 requests==2.32.3  # Update to latest stable version
 pytubefix==8.12.3  # Working alternative to yt-dlp for YouTube downloads
+yt-dlp
