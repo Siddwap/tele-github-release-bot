@@ -9,7 +9,7 @@ import logging
 import signal
 import subprocess
 import os
-from bot import TelegramBot
+from main import TelegramBot
 from config import BotConfig
 from threading import Thread
 
