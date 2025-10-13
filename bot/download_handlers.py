@@ -252,9 +252,71 @@ async def download_from_url_streaming_silent(url: str, temp_file, should_stop: b
             await session.close()
 
 
+async def make_video_seekable(input_path: str, progress_msg=None) -> str:
+    """Re-encode video to make it seekable with proper keyframes"""
+    try:
+        if progress_msg:
+            await progress_msg.edit("🔄 **Optimizing video for seeking...**\n⏳ This may take a few minutes...")
+        
+        # Create output path
+        dir_name = os.path.dirname(input_path)
+        base_name = os.path.basename(input_path)
+        output_path = os.path.join(dir_name, f"seekable_{base_name}")
+        
+        logger.info(f"Making video seekable: {input_path} -> {output_path}")
+        
+        # FFmpeg command to re-encode with keyframes every 2 seconds
+        # Using faster preset to reduce processing time
+        process = await asyncio.create_subprocess_exec(
+            'ffmpeg',
+            '-i', input_path,
+            '-c:v', 'libx264',
+            '-preset', 'fast',  # Faster than medium but still good quality
+            '-crf', '23',
+            '-c:a', 'copy',  # Copy audio without re-encoding to save time
+            '-movflags', '+faststart',  # Enable faststart for web playback
+            '-g', '48',  # GOP size (keyframe interval) - 2 seconds at 24fps
+            '-keyint_min', '24',  # Minimum keyframe interval
+            '-maxrate', '2M',
+            '-bufsize', '4M',
+            output_path,
+            '-y',  # Overwrite output file
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        stdout, stderr = await process.communicate()
+        
+        if process.returncode == 0:
+            logger.info(f"Successfully made video seekable: {output_path}")
+            # Remove original file and rename
+            try:
+                os.unlink(input_path)
+                final_path = input_path  # Use original path name
+                os.rename(output_path, final_path)
+                logger.info(f"Renamed seekable video to: {final_path}")
+                return final_path
+            except Exception as rename_error:
+                logger.error(f"Error renaming file: {rename_error}")
+                return output_path
+        else:
+            logger.error(f"FFmpeg error: {stderr.decode()}")
+            # If re-encoding fails, return original
+            if progress_msg:
+                await progress_msg.edit("⚠️ **Video optimization failed, using original...**")
+            return input_path
+            
+    except Exception as e:
+        logger.error(f"Error making video seekable: {e}")
+        # Return original if processing fails
+        if progress_msg:
+            await progress_msg.edit("⚠️ **Video optimization failed, using original...**")
+        return input_path
+
+
 async def download_youtube_with_ytdlp(youtube_url: str, quality: int, filename: str, 
                                      progress_msg, format_size_func, cookies_file: str = "cookies.txt") -> Optional[str]:
-    """Download YouTube video using yt-dlp with cookies for authentication"""
+    """Download YouTube video using yt-dlp with cookies for authentication and seekable videos"""
     output_path = None
     temp_dir = None
     
@@ -279,10 +341,11 @@ async def download_youtube_with_ytdlp(youtube_url: str, quality: int, filename: 
         temp_dir = tempfile.mkdtemp()
         output_template = os.path.join(temp_dir, "video.%(ext)s")
         
-        # Configure yt-dlp options with cookies
+        # Enhanced yt-dlp options for seekable videos
         ydl_opts = {
             'outtmpl': output_template,
-            'format': f'best[height<={quality}]/bestvideo[height<={quality}]+bestaudio/best',
+            # Priority format selection for seekable H.264 videos
+            'format': f'bestvideo[height<={quality}][vcodec^=avc1]+bestaudio/best[height<={quality}]/best',
             'merge_output_format': 'mp4',
             'quiet': True,
             'no_warnings': False,
@@ -296,6 +359,13 @@ async def download_youtube_with_ytdlp(youtube_url: str, quality: int, filename: 
             'fragment_retries': 10,
             'skip_unavailable_fragments': True,
             'keep_fragments': True,
+            # Post-processing for better compatibility
+            'postprocessor_args': {
+                'ffmpeg': [
+                    '-c', 'copy',  # Try to copy streams without re-encoding first
+                    '-movflags', '+faststart'  # Enable faststart for web playback
+                ]
+            },
         }
         
         # Add cookies if available
@@ -377,6 +447,13 @@ async def download_youtube_with_ytdlp(youtube_url: str, quality: int, filename: 
                 duration = info.get('duration', 0)
                 uploader = info.get('uploader', 'Unknown Uploader')
                 
+                # Log available formats for debugging
+                formats = info.get('formats', [])
+                h264_formats = [f for f in formats if f.get('vcodec', '').startswith('avc1')]
+                logger.info(f"Available H.264 formats: {len(h264_formats)}")
+                for fmt in h264_formats[:3]:  # Log first 3 H.264 formats
+                    logger.info(f"H.264 format: {fmt.get('format_note', 'N/A')} - {fmt.get('vcodec', 'N/A')} - {fmt.get('resolution', 'N/A')}")
+                
                 await progress_msg.edit(
                     f"📥 **Downloading video from YouTube...**\n"
                     f"📁 **File:** `{filename}`\n"
@@ -425,7 +502,7 @@ async def download_youtube_with_ytdlp(youtube_url: str, quality: int, filename: 
             f"🎬 **Title:** {video_title[:50]}...\n"
             f"📊 **Size:** {format_size_func(file_size)}\n"
             f"📊 **Quality:** {quality}p\n"
-            f"⏳ Preparing for upload..."
+            f"⏳ Optimizing video..."
         )
         
         return output_path
@@ -553,7 +630,7 @@ async def download_youtube_with_pytubefix(youtube_url: str, quality: int, filena
             f"🎬 **Title:** {yt.title[:50]}...\n"
             f"📊 **Size:** {format_size_func(file_size)}\n"
             f"📊 **Quality:** {stream.resolution}\n"
-            f"⏳ Preparing for upload..."
+            f"⏳ Optimizing video..."
         )
         
         return output_path
@@ -570,21 +647,43 @@ async def download_youtube_with_pytubefix(youtube_url: str, quality: int, filena
 
 
 async def download_youtube_video(youtube_url: str, quality: int, filename: str, 
-                                progress_msg, format_size_func, cookies_file: str = "cookies.txt") -> Optional[str]:
-    """Main YouTube download function with fallback - prefers yt-dlp with cookies"""
+                                progress_msg, format_size_func, cookies_file: str = "cookies.txt",
+                                make_seekable: bool = True) -> Optional[str]:
+    """Main YouTube download function with seekable video support"""
     try:
         # First try with yt-dlp (with cookies)
-        return await download_youtube_with_ytdlp(youtube_url, quality, filename, progress_msg, format_size_func, cookies_file)
+        output_path = await download_youtube_with_ytdlp(youtube_url, quality, filename, progress_msg, format_size_func, cookies_file)
+        
+        # Make video seekable if requested
+        if make_seekable and output_path:
+            output_path = await make_video_seekable(output_path, progress_msg)
+        
+        return output_path
+        
     except Exception as e:
         logger.warning(f"yt-dlp with cookies failed, trying without cookies: {e}")
         try:
             # Try yt-dlp without cookies
-            return await download_youtube_with_ytdlp(youtube_url, quality, filename, progress_msg, format_size_func, None)
+            output_path = await download_youtube_with_ytdlp(youtube_url, quality, filename, progress_msg, format_size_func, None)
+            
+            # Make video seekable if requested
+            if make_seekable and output_path:
+                output_path = await make_video_seekable(output_path, progress_msg)
+            
+            return output_path
+            
         except Exception as e2:
             logger.warning(f"yt-dlp without cookies failed, trying pytubefix: {e2}")
             try:
                 # Final fallback to pytubefix
-                return await download_youtube_with_pytubefix(youtube_url, quality, filename, progress_msg, format_size_func)
+                output_path = await download_youtube_with_pytubefix(youtube_url, quality, filename, progress_msg, format_size_func)
+                
+                # Make video seekable if requested
+                if make_seekable and output_path:
+                    output_path = await make_video_seekable(output_path, progress_msg)
+                
+                return output_path
+                
             except Exception as e3:
                 logger.error(f"All YouTube download methods failed: {e3}")
                 raise Exception(f"YouTube download failed: {e3}")
