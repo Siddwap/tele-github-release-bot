@@ -278,7 +278,7 @@ async def download_youtube_with_pytubefix(youtube_url: str, quality: int, filena
             except Exception as e:
                 logger.error(f"Error in progress callback: {e}")
         
-        yt = YouTube(youtube_url, 'WEB', on_progress_callback=on_progress)
+        yt = YouTube(youtube_url, use_po_token=True, client='WEB', on_progress_callback=on_progress)
         
         logger.info(f"Video title: {yt.title}")
         logger.info(f"Video length: {yt.length} seconds")
