@@ -95,7 +95,9 @@ def is_youtube_url(text: str) -> bool:
         'youtube.com/watch',
         'youtu.be/',
         'm.youtube.com/watch',
-        'youtube.com/shorts'
+        'youtube.com/shorts',
+        'www.youtube.com/live,
+        'youtube.com/live'
     ]
     return any(pattern in text.lower() for pattern in youtube_patterns)
 
