@@ -257,3 +257,46 @@ class GitHubUploader:
         except Exception as e:
             logger.error(f"Error renaming asset: {e}")
             raise
+
+    async def rename_asset_fast(self, old_filename: str, new_filename: str) -> bool:
+        """Rename an asset using GitHub API PATCH request (faster method)"""
+        try:
+            assets = await self.list_release_assets()
+            
+            # Find the asset with matching filename
+            target_asset = None
+            for asset in assets:
+                if asset['name'] == old_filename:
+                    target_asset = asset
+                    break
+            
+            if not target_asset:
+                return False
+            
+            # Use GitHub API to update asset name directly
+            url = f"{self.api_url}/repos/{self.repo}/releases/assets/{target_asset['id']}"
+            headers = {
+                "Authorization": f"token {self.token}",
+                "Accept": "application/vnd.github.v3+json",
+                "Content-Type": "application/json"
+            }
+            
+            data = {
+                "name": new_filename
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.patch(url, headers=headers, json=data) as response:
+                    if response.status == 200:
+                        logger.info(f"Successfully renamed asset: '{old_filename}' -> '{new_filename}'")
+                        return True
+                    else:
+                        # If PATCH fails, fall back to the old method
+                        error_text = await response.text()
+                        logger.warning(f"Fast rename failed with status {response.status}: {error_text}, falling back to download/upload method")
+                        return await self.rename_asset(old_filename, new_filename)
+                        
+        except Exception as e:
+            logger.error(f"Error in fast rename, falling back to old method: {e}")
+            # Fall back to the old method if fast rename fails
+            return await self.rename_asset(old_filename, new_filename)
