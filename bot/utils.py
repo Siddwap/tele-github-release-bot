@@ -20,7 +20,7 @@ def sanitize_filename_preserve_unicode(filename: str) -> str:
     
     # Only replace truly problematic characters, preserve Unicode
     # Remove: < > : " | ? * \ / and control characters
-    name_part = re.sub(r'[<>:"|?*\\/\x00-\x1f\x7f]', '_', name_part)
+    name_part = re.sub(r'[<>:"|?#%,()!@;*\\/\x00-\x1f\x7f]', '_', name_part)
     
     # Replace multiple spaces with single space
     name_part = re.sub(r'\s+', ' ', name_part)
