@@ -4,12 +4,18 @@ Utility functions for the Telegram bot
 import re
 import logging
 from typing import List, Dict
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
 
 def sanitize_filename_preserve_unicode(filename: str) -> str:
     """Sanitize filename while preserving Unicode characters like Hindi"""
+    # If filename is empty or not available, generate one with timestamp
+    if not filename or filename.strip() == '':
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return f"file_{timestamp}"
+    
     # Split filename and extension
     if '.' in filename:
         name_part = '.'.join(filename.split('.')[:-1])
@@ -30,7 +36,8 @@ def sanitize_filename_preserve_unicode(filename: str) -> str:
     
     # Ensure we have some content
     if not name_part:
-        name_part = 'file'
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        name_part = f"file_{timestamp}"
     
     # Reconstruct filename with extension
     if extension:
@@ -76,7 +83,10 @@ def get_file_extension_from_url(url: str) -> str:
     """Extract file extension from URL"""
     clean_url = url.split('?')[0]  # Remove query parameters
     if '.' in clean_url:
-        return clean_url.split('.')[-1].lower()
+        extension = clean_url.split('.')[-1].lower()
+        # Validate extension (basic check)
+        if len(extension) <= 6 and re.match(r'^[a-z0-9]+$', extension):
+            return extension
     return ''
 
 
@@ -127,7 +137,12 @@ async def parse_txt_file_content(content: str, detect_file_type_func, get_extens
                 filename = parts[0].strip()
                 url = parts[1].strip()
                 
-                if filename and url:
+                if url and is_url(url):  # Check if URL is valid
+                    # If filename is empty, generate one with timestamp
+                    if not filename:
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        filename = f"file_{timestamp}"
+                    
                     # Detect file type from URL
                     file_type = detect_file_type_func(url)
                     
@@ -138,22 +153,28 @@ async def parse_txt_file_content(content: str, detect_file_type_func, get_extens
                             filename = f"{filename}.{ext}"
                     
                     parsed_items.append({
-                        'filename': filename,
+                        'filename': sanitize_filename_preserve_unicode(filename),
                         'url': url,
                         'file_type': file_type,
                         'line_number': line_num
                     })
                 else:
-                    logger.warning(f"Invalid format on line {line_num}: {line}")
+                    logger.warning(f"Invalid URL on line {line_num}: {url}")
             else:
                 logger.warning(f"Invalid format on line {line_num}: {line}")
         else:
             # Treat as URL only, generate filename
-            if line.startswith('http'):
+            if is_url(line):
                 url = line
+                # Extract filename from URL or generate with timestamp
                 filename = url.split('/')[-1] or f"file_{line_num}"
                 if '?' in filename:
                     filename = filename.split('?')[0]
+                
+                # If no proper filename extracted, use timestamp
+                if not filename or filename.strip() == '' or len(filename) > 255:
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    filename = f"file_{timestamp}"
                 
                 file_type = detect_file_type_func(url)
                 
@@ -166,7 +187,7 @@ async def parse_txt_file_content(content: str, detect_file_type_func, get_extens
                         filename = f"{filename}.bin"
                 
                 parsed_items.append({
-                    'filename': filename,
+                    'filename': sanitize_filename_preserve_unicode(filename),
                     'url': url,
                     'file_type': file_type,
                     'line_number': line_num
